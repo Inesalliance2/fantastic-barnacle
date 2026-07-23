@@ -1,0 +1,103 @@
+### Test hello
+GET http://localhost:3000/hello
+
+### Register Consumer
+POST http://localhost:3000/api/register/consumer
+Content-Type: application/json
+
+{
+    "firstName": "Ines",
+    "lastName": "Wakusomba",
+    "email": "ineswakusomba2@test.com",
+    "phone": "0831234567",
+    "password": "test123"
+}
+
+### Register Manager
+POST http://localhost:3000/api/register/manager
+Content-Type: application/json
+
+{
+    "firstName": "James",
+    "lastName": "Smith",
+    "email": "jamesSmith2@test.com",
+    "phone": "0821234567",
+    "password": "test123",
+    "managerCode": "MGR003",
+    "branchCode": "BR003"
+}
+
+### Login
+POST http://localhost:3000/api/login
+Content-Type: application/json
+
+{
+    "email": "ineswakusomba@test.com",
+    "password": "test123"
+}
+
+### Get User Profile
+GET http://localhost:3000/api/user/120002
+
+### Update User Profile
+PUT http://localhost:3000/api/user/120002
+Content-Type: application/json
+
+{
+    "firstName": "Ines",
+    "lastName": "Wakusomba",
+    "email": "ineswakusomba@test.com",
+    "phone": "0831234567"
+}
+
+### Get All Categories
+GET http://localhost:3000/api/categories
+
+### Add Product
+POST http://localhost:3000/api/product
+Content-Type: application/json
+
+{
+    "productName": "Apples",
+    "brand": "Granny Smith",
+    "typicalUnit": "kg",
+    "categoryID": 1,
+    "price": 24.99,
+    "storeID": 1
+}
+
+### Get Store Products
+GET http://localhost:3000/api/store/1/products
+
+### Update Price (using storeProductID 5 - Bananas at Store 1)
+POST http://localhost:3000/api/product/5/price
+Content-Type: application/json
+
+{
+    "price": 19.99
+}
+
+### Update Availability (using storeProductID 7 - Eggs which is currently 0/false)
+PUT http://localhost:3000/api/product/7/availability
+Content-Type: application/json
+
+{
+    "available": true
+}
+
+### Get Store Info
+GET http://localhost:3000/api/store/1
+
+### Update Store Info
+PUT http://localhost:3000/api/store/1
+Content-Type: application/json
+
+{
+    "storeName": "Pick n Pay Walmer Park",
+    "storeChain": "Pick n Pay",
+    "location": "Walmer Park Shopping Centre, Port Elizabeth",
+    "openingHours": "08:00-21:00"
+}
+
+### Delete Product (using storeProductID 10 - Omo Washing Powder)
+DELETE http://localhost:3000/api/product/10
