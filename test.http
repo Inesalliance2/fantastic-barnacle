@@ -1,20 +1,20 @@
 ### Test hello
-GET http://localhost:3000/hello
+GET https://fantastic-barnacle-y2sc.onrender.com/hello
 
 ### Register Consumer
-POST http://localhost:3000/api/register/consumer
+POST https://fantastic-barnacle-y2sc.onrender.com/api/register/consumer
 Content-Type: application/json
 
 {
     "firstName": "Ines",
     "lastName": "Wakusomba",
-    "email": "ineswakusomba2@test.com",
+    "email": "ineswakusomba3@test.com",
     "phone": "0831234567",
     "password": "test123"
 }
 
 ### Register Manager
-POST http://localhost:3000/api/register/manager
+POST https://fantastic-barnacle-y2sc.onrender.com/api/register/manager
 Content-Type: application/json
 
 {
@@ -28,7 +28,7 @@ Content-Type: application/json
 }
 
 ### Login
-POST http://localhost:3000/api/login
+POST https://fantastic-barnacle-y2sc.onrender.com/api/login
 Content-Type: application/json
 
 {
@@ -37,10 +37,10 @@ Content-Type: application/json
 }
 
 ### Get User Profile
-GET http://localhost:3000/api/user/120002
+GET https://fantastic-barnacle-y2sc.onrender.com/api/user/120002
 
 ### Update User Profile
-PUT http://localhost:3000/api/user/120002
+PUT https://fantastic-barnacle-y2sc.onrender.com/api/user/120002
 Content-Type: application/json
 
 {
@@ -51,10 +51,10 @@ Content-Type: application/json
 }
 
 ### Get All Categories
-GET http://localhost:3000/api/categories
+GET https://fantastic-barnacle-y2sc.onrender.com/api/categories
 
 ### Add Product
-POST http://localhost:3000/api/product
+POST https://fantastic-barnacle-y2sc.onrender.com/api/product
 Content-Type: application/json
 
 {
@@ -67,10 +67,10 @@ Content-Type: application/json
 }
 
 ### Get Store Products
-GET http://localhost:3000/api/store/1/products
+GET https://fantastic-barnacle-y2sc.onrender.com/api/store/1/products
 
 ### Update Price (using storeProductID 5 - Bananas at Store 1)
-POST http://localhost:3000/api/product/5/price
+POST https://fantastic-barnacle-y2sc.onrender.com/api/product/5/price
 Content-Type: application/json
 
 {
@@ -78,7 +78,7 @@ Content-Type: application/json
 }
 
 ### Update Availability (using storeProductID 7 - Eggs which is currently 0/false)
-PUT http://localhost:3000/api/product/7/availability
+PUT https://fantastic-barnacle-y2sc.onrender.com/api/product/7/availability
 Content-Type: application/json
 
 {
@@ -86,10 +86,10 @@ Content-Type: application/json
 }
 
 ### Get Store Info
-GET http://localhost:3000/api/store/1
+GET https://fantastic-barnacle-y2sc.onrender.com/api/store/1
 
 ### Update Store Info
-PUT http://localhost:3000/api/store/1
+PUT https://fantastic-barnacle-y2sc.onrender.com/api/store/1
 Content-Type: application/json
 
 {
@@ -100,4 +100,4 @@ Content-Type: application/json
 }
 
 ### Delete Product (using storeProductID 10 - Omo Washing Powder)
-DELETE http://localhost:3000/api/product/10
+DELETE https://fantastic-barnacle-y2sc.onrender.com/api/product/10
