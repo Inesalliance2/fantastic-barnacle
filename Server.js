@@ -1,3 +1,5 @@
+const jwt = require('jsonwebtoken');
+const JWT_SECRET = process.env.JWT_SECRET || 'betterbasket_secret_key';
 const express = require('express');
 const mysql = require('mysql2');
 const cors = require('cors');
@@ -102,19 +104,25 @@ app.post('/api/login', async (req, res) => {
 
     pool.query(`SELECT * FROM user WHERE email = ?`, [email], async (err, results) => {
         if (err) return res.status(500).json({ error: 'Server error' });
-        if (results.length === 0) return res.status(401).json({ error: 'Invalid email or password' });
+        if (resultgit status
+s.length === 0) return res.status(401).json({ error: 'Invalid email or password' });
 
         const user = results[0];
         const passwordMatch = await bcrypt.compare(password, user.passwordHash);
         if (!passwordMatch) return res.status(401).json({ error: 'Invalid email or password' });
 
         res.status(200).json({
-            message: 'Login successful',
-            userID: user.userID,
-            userType: user.userType,
-            firstName: user.firstName,
-            lastName: user.lastName
-        });
+    message: 'Login successful',
+    userID: user.userID,
+    userType: user.userType,
+    firstName: user.firstName,
+    lastName: user.lastName,
+    token: jwt.sign(
+        { userID: user.userID, userType: user.userType },
+        JWT_SECRET,
+        { expiresIn: '7d' }
+    )
+});
     });
 });
 
