@@ -104,8 +104,7 @@ app.post('/api/login', async (req, res) => {
 
     pool.query(`SELECT * FROM user WHERE email = ?`, [email], async (err, results) => {
         if (err) return res.status(500).json({ error: 'Server error' });
-        if (resultgit status
-s.length === 0) return res.status(401).json({ error: 'Invalid email or password' });
+    if (result.affectedRows === 0) return res.status(404).json({ error: 'invalid email or password' });
 
         const user = results[0];
         const passwordMatch = await bcrypt.compare(password, user.passwordHash);
