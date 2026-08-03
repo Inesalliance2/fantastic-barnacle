@@ -97,33 +97,49 @@ app.post('/api/register/manager', async (req, res) => {
     }
 });
 
-// ─── LOGIN ───────────────────────────────────────────────────────
-app.post('/api/login', async (req, res) => {
+// ─── LOGIN CONSUMER ───────────────────────────────────────────
+app.post('/api/login/consumer', async (req, res) => {
     const { email, password } = req.body;
-    if (!email || !password) return res.status(400).json({ error: 'Email and password are required' });
+    if (!email || !password) {
+        return res.status(400).json({ error: 'Missing email or password' });
+    }
 
-    pool.query(`SELECT * FROM user WHERE email = ?`, [email], async (err, results) => {
-        if (err) return res.status(500).json({ error: 'Server error' });
-    if (result.affectedRows === 0) return res.status(404).json({ error: 'invalid email or password' });
+    try {
+        // Find user by email
+        const findUser = `SELECT * FROM user WHERE email = ? AND userType = 'consumer'`;
+        pool.query(findUser, [email], async (err, results) => {
+            if (err) {
+                console.error('Error finding user:', err);
+                return res.status(500).json({ error: 'Server error' });
+            }
 
-        const user = results[0];
-        const passwordMatch = await bcrypt.compare(password, user.passwordHash);
-        if (!passwordMatch) return res.status(401).json({ error: 'Invalid email or password' });
+            if (results.length === 0) {
+                return res.status(401).json({ error: 'Invalid credentials' });
+            }
 
-        res.status(200).json({
-    message: 'Login successful',
-    userID: user.userID,
-    userType: user.userType,
-    firstName: user.firstName,
-    lastName: user.lastName,
-    token: jwt.sign(
-        { userID: user.userID, userType: user.userType },
-        JWT_SECRET,
-        { expiresIn: '7d' }
-    )
+            const user = results[0];
+
+            // ✅ Compare plain password with stored hash
+            const isMatch = await bcrypt.compare(password, user.passwordHash);
+            if (!isMatch) {
+                return res.status(401).json({ error: 'Invalid credentials' });
+            }
+
+            // If you want to issue a token (JWT for example)
+            // const token = jwt.sign({ userID: user.userID }, process.env.JWT_SECRET, { expiresIn: '1h' });
+
+            res.status(200).json({
+                message: 'Login successful',
+                userID: user.userID,
+                // token: token   // uncomment if using JWT
+            });
+        });
+    } catch (err) {
+        console.error('Login error:', err);
+        res.status(500).json({ error: 'Server error' });
+    }
 });
-    });
-});
+
 
 // ─── GET USER PROFILE ────────────────────────────────────────────
 app.get('/api/user/:userID', (req, res) => {
