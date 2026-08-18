@@ -393,6 +393,16 @@ app.delete('/api/product/:storeProductID', authenticateToken, (req, res) => {
     });
 });
 
+// Get all stores
+app.get('/api/stores', authenticateToken, (req, res) => {
+    db.query('SELECT storeID, storeName, storeChain, location, latitude, longitude, openingHours FROM store ORDER BY storeName', (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch stores' });
+        }
+        res.status(200).json(results);
+    });
+});
+
 // Get store information
 app.get('/api/store/:storeID', authenticateToken, (req, res) => {
     const { storeID } = req.params;
