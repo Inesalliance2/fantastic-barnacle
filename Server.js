@@ -162,14 +162,27 @@ app.post('/api/login', (req, res) => {
             { expiresIn: '7d' }
         );
 
+        if (user.userType === 'manager') {
+    db.query('SELECT storeID FROM manager WHERE userID = ?', [user.userID], (err, results) => {
+        const storeID = results && results[0] ? results[0].storeID : null;
         res.status(200).json({
-            message: 'Login successful',
             userID: user.userID,
             userType: user.userType,
             firstName: user.firstName,
             lastName: user.lastName,
-            token
+            storeID: storeID,
+            token: token
         });
+    });
+} else {
+    res.status(200).json({
+        userID: user.userID,
+        userType: user.userType,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        token: token
+    });
+}
     });
 });
 
