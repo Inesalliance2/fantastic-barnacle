@@ -231,10 +231,22 @@ app.put('/api/user/:userID', authenticateToken, async (req, res) => {
             query += ' WHERE userID = ?';
             params.push(userID);
 
-            db.query(query, params, (err3) => {
+                        db.query(query, params, (err3) => {
                 if (err3) {
                     return res.status(500).json({ error: 'Update failed' });
                 }
+
+                const { latitude, longitude } = req.body;
+                if (latitude !== undefined && longitude !== undefined) {
+                    db.query(
+                        'UPDATE consumer SET latitude = ?, longitude = ? WHERE userID = ?',
+                        [latitude, longitude, userID],
+                        (err4) => {
+                            if (err4) console.error('Failed to update consumer location:', err4.message);
+                        }
+                    );
+                }
+
                 res.status(200).json({ message: 'Profile updated successfully' });
             });
         });
