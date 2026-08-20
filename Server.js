@@ -483,6 +483,47 @@ app.put('/api/manager/:userID/store', authenticateToken, (req, res) => {
         });
     });
 });
+// ===== DISCOUNT ROUTES (B800) =====
+
+// Get all discounts for a store (with product name join)
+app.get('/api/discounts/store/:storeID', authenticateToken, (req, res) => {
+    const { storeID } = req.params;
+    const query = `
+        SELECT d.discountID, d.storeProductID, d.discountPercent,
+               d.startDate, d.endDate, p.productName
+        FROM discountoffer d
+        JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
+        JOIN product p ON sp.productID = p.productID
+        WHERE sp.storeID = ?
+        ORDER BY d.endDate DESC
+    `;
+    db.query(query, [storeID], (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch discounts' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// Create a new discount
+app.post('/api/discounts', authenticateToken, (req, res) => {
+    const { storeProductID, discountPercent, startDate, endDate } = req.body;
+    if (!storeProductID || !discountPercent || !endDate) {
+        return res.status(400).json({ error: 'storeProductID, discountPercent, and endDate are required' });
+    }
+    const effectiveStartDate = startDate || new Date().toISOString().slice(0, 10);
+    db.query(
+        'INSERT INTO discountoffer (storeProductID, discountPercent, startDate, endDate) VALUES (?, ?, ?, ?)',
+        [storeProductID, discountPercent, effectiveStartDate, endDate],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to create discount' });
+            }
+            res.status(201).json({ message: 'Discount created successfully', discountID: result.insertId });
+        }
+    );
+});
+
 
 // ===== C-Series: Fuel Settings (C100/C200/C300) =====
 
