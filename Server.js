@@ -472,6 +472,417 @@ app.put('/api/manager/:userID/store', authenticateToken, (req, res) => {
     });
 });
 
+// ===== C-Series: Fuel Settings (C100/C200/C300) =====
+
+// Get consumer fuel settings
+app.get('/api/consumer/:userID/fuel', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+
+    db.query(
+        'SELECT fuelPricePerLitre, consumptionLitresPer100km, fuelRegion, fuelManualOverride FROM consumer WHERE userID = ?',
+        [userID],
+        (err, results) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to fetch fuel settings' });
+            }
+
+            if (results.length === 0) {
+                return res.status(404).json({ error: 'No fuel settings found' });
+            }
+
+            const row = results[0];
+            res.status(200).json({
+                userID: parseInt(userID),
+                fuelPricePerLitre: row.fuelPricePerLitre || 0,
+                consumptionLitresPer100km: row.consumptionLitresPer100km || 0,
+                region: row.fuelRegion || 'inland',
+                manualOverride: row.fuelManualOverride ? true : false
+            });
+        }
+    );
+});
+
+// Update consumer fuel settings
+app.put('/api/consumer/:userID/fuel', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    const { fuelPricePerLitre, consumptionLitresPer100km, region, manualOverride } = req.body;
+
+    if (!fuelPricePerLitre || fuelPricePerLitre <= 0) {
+        return res.status(400).json({ error: 'Fuel price must be greater than 0' });
+    }
+
+    if (!consumptionLitresPer100km || consumptionLitresPer100km < 3.0 || consumptionLitresPer100km > 25.0) {
+        return res.status(400).json({ error: 'Consumption must be between 3.0 and 25.0 L/100km' });
+    }
+
+    db.query(
+        'UPDATE consumer SET fuelPricePerLitre = ?, consumptionLitresPer100km = ?, fuelRegion = ?, fuelManualOverride = ? WHERE userID = ?',
+        [fuelPricePerLitre, consumptionLitresPer100km, region || 'inland', manualOverride ? 1 : 0, userID],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to update fuel settings' });
+            }
+
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Consumer not found' });
+            }
+
+            res.status(200).json({ message: 'Fuel settings updated successfully' });
+        }
+    );
+});
+
+// ===== C-Series: Consumer Preferences (C400/C500/C600) =====
+
+// Get consumer preferences
+app.get('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+
+    db.query('SELECT maxTravelDistanceKm FROM consumer WHERE userID = ?', [userID], (err, consumerResults) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch preferences' });
+        }
+
+        if (consumerResults.length === 0) {
+            return res.status(404).json({ error: 'Consumer not found' });
+        }
+
+        const maxTravelDistanceKm = consumerResults[0].maxTravelDistanceKm || 10;
+
+        const storeQuery = `
+            SELECT p.preferenceValue, up.consumerID
+            FROM preference p
+            LEFT JOIN userPreference up ON p.preferenceID = up.preferenceID AND up.consumerID = ?
+            WHERE p.preferenceType = 'store'
+        `;
+
+        db.query(storeQuery, [userID], (err2, storeResults) => {
+            if (err2) {
+                return res.status(500).json({ error: 'Failed to fetch preferences' });
+            }
+
+            const preferredStores = [];
+            const excludedStores = [];
+
+            for (const row of storeResults) {
+                if (row.consumerID) {
+                    preferredStores.push(row.preferenceValue);
+                } else {
+                    excludedStores.push(row.preferenceValue);
+                }
+            }
+
+            const dietaryQuery = `
+                SELECT p.preferenceValue, up.consumerID
+                FROM preference p
+                LEFT JOIN userPreference up ON p.preferenceID = up.preferenceID AND up.consumerID = ?
+                WHERE p.preferenceType = 'dietary'
+            `;
+
+            db.query(dietaryQuery, [userID], (err3, dietaryResults) => {
+                if (err3) {
+                    return res.status(200).json({ maxTravelDistanceKm, preferredStores, excludedStores, dietaryFilters: {} });
+                }
+
+                const dietaryFilters = {};
+                for (const row of dietaryResults) {
+                    dietaryFilters[row.preferenceValue] = row.consumerID ? true : false;
+                }
+
+                res.status(200).json({ maxTravelDistanceKm, preferredStores, excludedStores, dietaryFilters });
+            });
+        });
+    });
+});
+
+// Update consumer preferences
+app.put('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    const { maxTravelDistanceKm, preferredStores, dietaryFilters } = req.body;
+
+    if (maxTravelDistanceKm !== undefined && maxTravelDistanceKm <= 0) {
+        return res.status(400).json({ error: 'Distance must be greater than 0' });
+    }
+
+    const distanceUpdate = maxTravelDistanceKm !== undefined
+        ? new Promise((resolve, reject) => {
+            db.query('UPDATE consumer SET maxTravelDistanceKm = ? WHERE userID = ?', [maxTravelDistanceKm, userID], (err) => {
+                if (err) reject(err); else resolve();
+            });
+        })
+        : Promise.resolve();
+
+    distanceUpdate.then(() => {
+        if (preferredStores && Array.isArray(preferredStores)) {
+            db.query(
+                `DELETE FROM userPreference WHERE consumerID = ? AND preferenceID IN (SELECT preferenceID FROM preference WHERE preferenceType = 'store')`,
+                [userID],
+                (err) => {
+                    if (err) {
+                        return res.status(500).json({ error: 'Failed to update store preferences' });
+                    }
+
+                    if (preferredStores.length === 0) {
+                        return updateDietaryAndRespond();
+                    }
+
+                    const placeholders = preferredStores.map(() => '?').join(',');
+                    const insertQuery = `
+                        INSERT INTO userPreference (consumerID, preferenceID)
+                        SELECT ?, preferenceID FROM preference
+                        WHERE preferenceType = 'store' AND preferenceValue IN (${placeholders})
+                    `;
+
+                    db.query(insertQuery, [userID, ...preferredStores], (err2) => {
+                        if (err2) {
+                            return res.status(500).json({ error: 'Failed to update store preferences' });
+                        }
+                        updateDietaryAndRespond();
+                    });
+                }
+            );
+        } else {
+            updateDietaryAndRespond();
+        }
+    }).catch(() => {
+        return res.status(500).json({ error: 'Failed to update preferences' });
+    });
+
+    function updateDietaryAndRespond() {
+        if (dietaryFilters && typeof dietaryFilters === 'object') {
+            db.query(
+                `DELETE FROM userPreference WHERE consumerID = ? AND preferenceID IN (SELECT preferenceID FROM preference WHERE preferenceType = 'dietary')`,
+                [userID],
+                (err) => {
+                    if (err) {
+                        return res.status(200).json({ message: 'Preferences updated (dietary sync failed)' });
+                    }
+
+                    const activeFilters = Object.entries(dietaryFilters).filter(([_, v]) => v).map(([k]) => k);
+
+                    if (activeFilters.length === 0) {
+                        return res.status(200).json({ message: 'Preferences updated successfully' });
+                    }
+
+                    const placeholders = activeFilters.map(() => '?').join(',');
+                    const insertQuery = `
+                        INSERT INTO userPreference (consumerID, preferenceID)
+                        SELECT ?, preferenceID FROM preference
+                        WHERE preferenceType = 'dietary' AND preferenceValue IN (${placeholders})
+                    `;
+
+                    db.query(insertQuery, [userID, ...activeFilters], (err2) => {
+                        res.status(200).json({ message: 'Preferences updated successfully' });
+                    });
+                }
+            );
+        } else {
+            res.status(200).json({ message: 'Preferences updated successfully' });
+        }
+    }
+});
+
+// Stores within radius (C500)
+app.get('/api/stores/nearby', authenticateToken, (req, res) => {
+    const { lat, lng, radiusKm } = req.query;
+
+    if (!lat || !lng || !radiusKm) {
+        return res.status(400).json({ error: 'lat, lng, and radiusKm are required' });
+    }
+
+    const query = `
+        SELECT storeID, storeName, storeChain,
+            (6371 * acos(cos(radians(?)) * cos(radians(latitude)) *
+            cos(radians(longitude) - radians(?)) + sin(radians(?)) * sin(radians(latitude)))) AS distanceKm
+        FROM store
+        HAVING distanceKm <= ?
+        ORDER BY distanceKm
+    `;
+
+    db.query(query, [parseFloat(lat), parseFloat(lng), parseFloat(lat), parseFloat(radiusKm)], (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch nearby stores' });
+        }
+
+        res.status(200).json({
+            count: results.length,
+            stores: results.map(r => ({
+                storeID: r.storeID,
+                storeName: r.storeName,
+                distanceKm: Math.round(r.distanceKm * 10) / 10
+            }))
+        });
+    });
+});
+
+// ===== C-Series: Product Search & Price History (C700/C800/C900) =====
+
+// Product search
+app.get('/api/product/search', authenticateToken, (req, res) => {
+    const { q } = req.query;
+
+    if (!q || q.trim().length === 0) {
+        return res.status(400).json({ error: 'Search query is required' });
+    }
+
+    const query = `
+        SELECT p.productID, p.productName, p.brand, pc.categoryName
+        FROM product p
+        LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+        WHERE p.productName LIKE CONCAT('%', ?, '%')
+        ORDER BY p.productName
+        LIMIT 20
+    `;
+
+    db.query(query, [q.trim()], (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Search failed' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// Multi-store price history for a product (C700/C900)
+app.get('/api/product/:productID/pricehistory', authenticateToken, (req, res) => {
+    const { productID } = req.params;
+    const days = parseInt(req.query.days) || 90;
+
+    const historyQuery = `
+        SELECT ph.recordedDate AS date, ph.price, s.storeID, s.storeName, s.storeChain,
+               sp.storeProductID
+        FROM pricehistory ph
+        JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
+        JOIN store s ON sp.storeID = s.storeID
+        WHERE sp.productID = ? AND ph.recordedDate >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+        ORDER BY s.storeID, ph.recordedDate
+    `;
+
+    const discountQuery = `
+        SELECT d.specialPrice, d.startDate, d.endDate, s.storeName, sp.storeProductID
+        FROM discountoffer d
+        JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
+        JOIN store s ON sp.storeID = s.storeID
+        WHERE sp.productID = ? AND d.endDate >= DATE_SUB(CURDATE(), INTERVAL ? DAY)
+    `;
+
+    db.query('SELECT productName FROM product WHERE productID = ?', [productID], (err, productResults) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch price history' });
+        }
+
+        if (productResults.length === 0) {
+            return res.status(404).json({ error: 'Product not found' });
+        }
+
+        const productName = productResults[0].productName;
+
+        db.query(historyQuery, [productID, days], (err2, historyResults) => {
+            if (err2) {
+                return res.status(500).json({ error: 'Failed to fetch price history' });
+            }
+
+            const storesMap = {};
+            for (const row of historyResults) {
+                if (!storesMap[row.storeID]) {
+                    storesMap[row.storeID] = {
+                        storeID: row.storeID,
+                        storeProductID: row.storeProductID,
+                        storeName: row.storeName,
+                        storeChain: row.storeChain,
+                        history: []
+                    };
+                }
+                storesMap[row.storeID].history.push({
+                    date: row.date ? row.date.toISOString().split('T')[0] : null,
+                    price: row.price
+                });
+            }
+
+            const stores = Object.values(storesMap);
+
+            db.query(discountQuery, [productID, days], (err3, discountResults) => {
+                if (err3) {
+                    return res.status(200).json({ productID: parseInt(productID), productName, stores, discounts: [] });
+                }
+
+                const discounts = discountResults.map(d => ({
+                    storeProductID: d.storeProductID,
+                    storeName: d.storeName,
+                    specialPrice: d.specialPrice,
+                    startDate: d.startDate ? d.startDate.toISOString().split('T')[0] : null,
+                    endDate: d.endDate ? d.endDate.toISOString().split('T')[0] : null
+                }));
+
+                res.status(200).json({ productID: parseInt(productID), productName, stores, discounts });
+            });
+        });
+    });
+});
+
+// Single store product price history (C800)
+app.get('/api/storeproduct/:storeProductID/pricehistory', authenticateToken, (req, res) => {
+    const { storeProductID } = req.params;
+    const { startDate, endDate } = req.query;
+
+    const infoQuery = `
+        SELECT sp.storeProductID, p.productName, s.storeName
+        FROM storeproduct sp
+        JOIN product p ON sp.productID = p.productID
+        JOIN store s ON sp.storeID = s.storeID
+        WHERE sp.storeProductID = ?
+    `;
+
+    db.query(infoQuery, [storeProductID], (err, infoResults) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch price history' });
+        }
+
+        if (infoResults.length === 0) {
+            return res.status(404).json({ error: 'Store product not found' });
+        }
+
+        const info = infoResults[0];
+
+        let historyQuery = `
+            SELECT priceHistoryID, price, recordedDate
+            FROM pricehistory
+            WHERE storeProductID = ?
+        `;
+        const params = [storeProductID];
+
+        if (startDate) {
+            historyQuery += ' AND recordedDate >= ?';
+            params.push(startDate);
+        }
+
+        if (endDate) {
+            historyQuery += ' AND recordedDate <= ?';
+            params.push(endDate);
+        }
+
+        historyQuery += ' ORDER BY recordedDate ASC';
+
+        db.query(historyQuery, params, (err2, historyResults) => {
+            if (err2) {
+                return res.status(500).json({ error: 'Failed to fetch price history' });
+            }
+
+            const history = historyResults.map(row => ({
+                priceHistoryID: row.priceHistoryID,
+                price: row.price,
+                recordedDate: row.recordedDate ? row.recordedDate.toISOString().split('T')[0] : null
+            }));
+
+            res.status(200).json({
+                storeProductID: parseInt(storeProductID),
+                productName: info.productName,
+                storeName: info.storeName,
+                history
+            });
+        });
+    });
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
