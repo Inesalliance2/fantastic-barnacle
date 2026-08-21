@@ -542,7 +542,31 @@ app.post('/api/discounts', authenticateToken, (req, res) => {
         }
     );
 });
+// Update an existing discount
+app.put('/api/discounts/:discountID', authenticateToken, (req, res) => {
+    const { discountID } = req.params;
+    const { discountPercent, startDate, endDate } = req.body;
 
+    if (!discountPercent || !endDate) {
+        return res.status(400).json({ error: 'discountPercent and endDate are required' });
+    }
+
+    const effectiveStartDate = startDate || new Date().toISOString().slice(0, 10);
+
+    db.query(
+        'UPDATE discountoffer SET discountPercent = ?, startDate = ?, endDate = ? WHERE discountID = ?',
+        [discountPercent, effectiveStartDate, endDate, discountID],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to update discount' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Discount not found' });
+            }
+            res.status(200).json({ message: 'Discount updated successfully' });
+        }
+    );
+});
 
 // ===== C-Series: Fuel Settings (C100/C200/C300) =====
 
