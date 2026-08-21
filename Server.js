@@ -1002,15 +1002,14 @@ app.get('/api/user/:userID/shopping-list', authenticateToken, (req, res) => {
         const itemQuery = `
             SELECT sli.productID, p.productName, p.brand, p.typicalUnit,
                    pc.categoryName, sli.quantity,
-                   (SELECT MIN(ph.price) FROM storeproduct sp
-                    JOIN pricehistory ph ON sp.storeProductID = ph.storeProductID
-                        AND ph.recordedDate = (SELECT MAX(ph2.recordedDate) FROM pricehistory ph2 WHERE ph2.storeProductID = sp.storeProductID)
-                    WHERE sp.productID = sli.productID AND sp.available = TRUE
-                   ) AS lowestPrice
+                   MIN(ph.price) AS lowestPrice
             FROM shoppinglistitem sli
             JOIN product p ON sli.productID = p.productID
             LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+            LEFT JOIN storeproduct sp ON p.productID = sp.productID AND sp.available = TRUE
+            LEFT JOIN pricehistory ph ON sp.storeProductID = ph.storeProductID
             WHERE sli.listID = ?
+            GROUP BY sli.productID, p.productName, p.brand, p.typicalUnit, pc.categoryName, sli.quantity
         `;
 
         db.query(itemQuery, [list.listID], (err2, items) => {
