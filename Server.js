@@ -1230,11 +1230,30 @@ app.get('/api/shopping-list/:listID/details', authenticateToken, (req, res) => {
 
         db.query(`
             SELECT sli.productID, p.productName, p.brand, p.typicalUnit,
-                   pc.categoryName, sli.quantity, sli.priceAtArchive
+                   pc.categoryName, sli.quantity, sli.priceAtArchive,
+                   MIN(store_latest.price) AS lowestPrice
             FROM shoppinglistitem sli
             JOIN product p ON sli.productID = p.productID
             LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+            LEFT JOIN (
+                SELECT sp.productID, sp.storeID, MAX(latest.price) AS price
+                FROM storeproduct sp
+                JOIN (
+                    SELECT ph.storeProductID, ph.price, ph.recordedDate
+                    FROM pricehistory ph
+                    INNER JOIN (
+                        SELECT storeProductID, MAX(recordedDate) AS maxDate
+                        FROM pricehistory
+                        GROUP BY storeProductID
+                    ) latest_dates
+                    ON ph.storeProductID = latest_dates.storeProductID
+                    AND ph.recordedDate = latest_dates.maxDate
+                ) latest ON sp.storeProductID = latest.storeProductID
+                WHERE sp.available = TRUE
+                GROUP BY sp.productID, sp.storeID
+            ) store_latest ON store_latest.productID = sli.productID
             WHERE sli.listID = ?
+            GROUP BY sli.productID, p.productName, p.brand, p.typicalUnit, pc.categoryName, sli.quantity, sli.priceAtArchive
         `, [listID], (err2, items) => {
             if (err2) {
                 return res.status(500).json({ error: 'Failed to fetch list items' });
@@ -1251,7 +1270,6 @@ app.get('/api/shopping-list/:listID/details', authenticateToken, (req, res) => {
         });
     });
 });
-
 // A900 — Copy archived list to active
 app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
     const { listID } = req.params;
