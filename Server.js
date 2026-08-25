@@ -570,8 +570,6 @@ app.put('/api/manager/:userID/store', authenticateToken, (req, res) => {
         });
     });
 });
-<<<<<<< HEAD
-=======
 // ===== DISCOUNT ROUTES (B800) =====
 
 // Get all discounts for a store (with product name join)
@@ -1456,7 +1454,6 @@ app.get('/api/store/:storeID/summary', authenticateToken, (req, res) => {
         });
     });
 });
->>>>>>> c0afcecf5d8df7f6c33020e85299ad21c2d0ca98
 
 // Start server
 const PORT = process.env.PORT || 3000;
