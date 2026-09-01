@@ -479,6 +479,204 @@ app.put('/api/store/:storeID', authenticateToken, (req, res) => {
     );
 });
 
+// Get all stores
+app.get('/api/stores', authenticateToken, (req, res) => {
+    db.query('SELECT storeID, storeName, storeChain, location, latitude, longitude, openingHours FROM store ORDER BY storeName', (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch stores' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// Get discounts for a store
+app.get('/api/store/:storeID/discounts', authenticateToken, (req, res) => {
+    const { storeID } = req.params;
+
+    const query = `
+        SELECT d.discountID, d.storeProductID, d.discountPercent, d.startDate, d.endDate,
+               p.productName, sp.available
+        FROM discountoffer d
+        JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
+        JOIN product p ON sp.productID = p.productID
+        WHERE sp.storeID = ?
+        ORDER BY d.endDate DESC
+    `;
+
+    db.query(query, [storeID], (err, results) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to fetch discounts' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// Add a new discount
+app.post('/api/discount', authenticateToken, (req, res) => {
+    const { storeProductID, discountPercent, startDate, endDate } = req.body;
+
+    if (!storeProductID || !discountPercent || !startDate || !endDate) {
+        return res.status(400).json({ error: 'All discount fields are required' });
+    }
+
+    db.query(
+        'INSERT INTO discountoffer (storeProductID, discountPercent, startDate, endDate) VALUES (?, ?, ?, ?)',
+        [storeProductID, discountPercent, startDate, endDate],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to add discount' });
+            }
+            res.status(201).json({ message: 'Discount added successfully', discountID: result.insertId });
+        }
+    );
+});
+
+// Update a discount
+app.put('/api/discount/:discountID', authenticateToken, (req, res) => {
+    const { discountID } = req.params;
+    const { discountPercent, startDate, endDate } = req.body;
+
+    if (!discountPercent || !startDate || !endDate) {
+        return res.status(400).json({ error: 'All discount fields are required' });
+    }
+
+    db.query(
+        'UPDATE discountoffer SET discountPercent = ?, startDate = ?, endDate = ? WHERE discountID = ?',
+        [discountPercent, startDate, endDate, discountID],
+        (err, result) => {
+            if (err) {
+                return res.status(500).json({ error: 'Failed to update discount' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Discount not found' });
+            }
+            res.status(200).json({ message: 'Discount updated successfully' });
+        }
+    );
+});
+
+// Delete a discount
+app.delete('/api/discount/:discountID', authenticateToken, (req, res) => {
+    const { discountID } = req.params;
+
+    db.query('DELETE FROM discountoffer WHERE discountID = ?', [discountID], (err, result) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to delete discount' });
+        }
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Discount not found' });
+        }
+        res.status(200).json({ message: 'Discount deleted successfully' });
+    });
+});
+
+// Set or update manager's store association (D1600)
+app.put('/api/manager/:userID/store', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    const { branchCode } = req.body;
+
+    if (!branchCode) {
+        return res.status(400).json({ error: 'Branch code is required' });
+    }
+
+    // Verify the branchCode matches an existing store
+    db.query('SELECT storeID, storeName, location FROM store WHERE storeID = ?', [branchCode], (err, stores) => {
+        if (err) {
+            return res.status(500).json({ error: 'Failed to look up store' });
+        }
+
+        if (stores.length === 0) {
+            return res.status(404).json({ error: 'Store not found. Please enter a valid branch code.' });
+        }
+
+        const store = stores[0];
+
+        // Update the manager's branchCode
+        db.query('UPDATE manager SET branchCode = ? WHERE userID = ?', [branchCode, userID], (err2, result) => {
+            if (err2) {
+                return res.status(500).json({ error: 'Failed to update store association' });
+            }
+
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Manager not found' });
+            }
+
+            res.status(200).json({
+                message: 'Store association updated successfully',
+                storeID: store.storeID,
+                storeName: store.storeName,
+                location: store.location
+            });
+        });
+    });
+});
+
+// ===== DISCOUNT ROUTES (B800/B900) =====
+
+// Get all discounts for a store (with product name join)
+app.get('/api/discounts/store/:storeID', authenticateToken, (req, res) => {
+    const { storeID } = req.params;
+    const query = `
+        SELECT d.discountID, d.storeProductID, d.discountPercent,
+               d.startDate, d.endDate, p.productName
+        FROM discountoffer d
+        JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
+        JOIN product p ON sp.productID = p.productID
+        WHERE sp.storeID = ?
+        ORDER BY d.endDate DESC
+    `;
+    db.query(query, [storeID], (err, results) => {
+        if (err) {
+            console.error('GET /api/discounts/store/:storeID error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch discounts' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// Create a new discount
+app.post('/api/discounts', authenticateToken, (req, res) => {
+    const { storeProductID, discountPercent, startDate, endDate } = req.body;
+    if (!storeProductID || !discountPercent || !endDate) {
+        return res.status(400).json({ error: 'storeProductID, discountPercent, and endDate are required' });
+    }
+    const effectiveStartDate = startDate || new Date().toISOString().slice(0, 10);
+    db.query(
+        'INSERT INTO discountoffer (storeProductID, discountPercent, startDate, endDate) VALUES (?, ?, ?, ?)',
+        [storeProductID, discountPercent, effectiveStartDate, endDate],
+        (err, result) => {
+            if (err) {
+                console.error('POST /api/discounts error:', err.message);
+                return res.status(500).json({ error: 'Failed to create discount' });
+            }
+            res.status(201).json({ message: 'Discount created successfully', discountID: result.insertId });
+        }
+    );
+});
+
+// Update an existing discount
+app.put('/api/discounts/:discountID', authenticateToken, (req, res) => {
+    const { discountID } = req.params;
+    const { discountPercent, startDate, endDate } = req.body;
+    if (!discountPercent || !endDate) {
+        return res.status(400).json({ error: 'discountPercent and endDate are required' });
+    }
+    db.query(
+        'UPDATE discountoffer SET discountPercent = ?, startDate = ?, endDate = ? WHERE discountID = ?',
+        [discountPercent, startDate, endDate, discountID],
+        (err, result) => {
+            if (err) {
+                console.error('PUT /api/discounts/:discountID error:', err.message);
+                return res.status(500).json({ error: 'Failed to update discount' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Discount not found' });
+            }
+            res.status(200).json({ message: 'Discount updated successfully' });
+        }
+    );
+});
+
 // ===== C-Series: Fuel Settings (C100/C200/C300) =====
 
 // Get consumer fuel settings
