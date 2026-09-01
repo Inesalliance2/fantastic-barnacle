@@ -162,14 +162,34 @@ app.post('/api/login', (req, res) => {
             { expiresIn: '7d' }
         );
 
-        res.status(200).json({
-            message: 'Login successful',
-            userID: user.userID,
-            userType: user.userType,
-            firstName: user.firstName,
-            lastName: user.lastName,
-            token
-        });
+        // For managers, resolve their associated store so the app has a storeID after login
+        if (user.userType === 'manager') {
+            db.query('SELECT branchCode FROM manager WHERE userID = ?', [user.userID], (mErr, mRows) => {
+                let storeID = 0;
+                if (!mErr && mRows.length > 0) {
+                    const parsed = parseInt(mRows[0].branchCode, 10);
+                    if (!isNaN(parsed)) storeID = parsed;
+                }
+                res.status(200).json({
+                    message: 'Login successful',
+                    userID: user.userID,
+                    userType: user.userType,
+                    firstName: user.firstName,
+                    lastName: user.lastName,
+                    storeID,
+                    token
+                });
+            });
+        } else {
+            res.status(200).json({
+                message: 'Login successful',
+                userID: user.userID,
+                userType: user.userType,
+                firstName: user.firstName,
+                lastName: user.lastName,
+                token
+            });
+        }
     });
 });
 
