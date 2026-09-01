@@ -306,15 +306,21 @@ app.get('/api/store/:storeID/products', authenticateToken, (req, res) => {
 
     const query = `
         SELECT sp.storeProductID, p.productID, p.productName, p.brand, p.typicalUnit,
-               pc.categoryName, ph.price, sp.available
+               pc.categoryName, latest.price, sp.available
         FROM storeproduct sp
         JOIN product p ON sp.productID = p.productID
         LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
-        LEFT JOIN pricehistory ph ON sp.storeProductID = ph.storeProductID
-            AND ph.recordedDate = (
-                SELECT MAX(ph2.recordedDate) FROM pricehistory ph2
-                WHERE ph2.storeProductID = sp.storeProductID
-            )
+        LEFT JOIN (
+            SELECT ph.storeProductID, ph.price
+            FROM pricehistory ph
+            INNER JOIN (
+                SELECT storeProductID, MAX(recordedDate) AS maxDate
+                FROM pricehistory
+                GROUP BY storeProductID
+            ) latest_dates
+            ON ph.storeProductID = latest_dates.storeProductID
+            AND ph.recordedDate = latest_dates.maxDate
+        ) latest ON sp.storeProductID = latest.storeProductID
         WHERE sp.storeID = ?
         ORDER BY p.productName
     `;
