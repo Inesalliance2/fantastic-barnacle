@@ -306,21 +306,15 @@ app.get('/api/store/:storeID/products', authenticateToken, (req, res) => {
 
     const query = `
         SELECT sp.storeProductID, p.productID, p.productName, p.brand, p.typicalUnit,
-               pc.categoryName, latest.price, sp.available
+               pc.categoryName, ph.price, sp.available
         FROM storeproduct sp
         JOIN product p ON sp.productID = p.productID
         LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
-        LEFT JOIN (
-            SELECT ph.storeProductID, ph.price
-            FROM pricehistory ph
-            INNER JOIN (
-                SELECT storeProductID, MAX(recordedDate) AS maxDate
-                FROM pricehistory
-                GROUP BY storeProductID
-            ) latest_dates
-            ON ph.storeProductID = latest_dates.storeProductID
-            AND ph.recordedDate = latest_dates.maxDate
-        ) latest ON sp.storeProductID = latest.storeProductID
+        LEFT JOIN pricehistory ph ON sp.storeProductID = ph.storeProductID
+            AND ph.recordedDate = (
+                SELECT MAX(ph2.recordedDate) FROM pricehistory ph2
+                WHERE ph2.storeProductID = sp.storeProductID
+            )
         WHERE sp.storeID = ?
         ORDER BY p.productName
     `;
@@ -328,6 +322,54 @@ app.get('/api/store/:storeID/products', authenticateToken, (req, res) => {
     db.query(query, [storeID], (err, results) => {
         if (err) {
             return res.status(500).json({ error: 'Failed to fetch products' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// D200: Price trend report — real price history figures per product for a store
+app.get('/api/store/:storeID/price-trends', authenticateToken, (req, res) => {
+    const { storeID } = req.params;
+
+    const query = `
+        SELECT p.productName,
+               pc.categoryName,
+               COUNT(ph.priceHistoryID)                      AS dataPoints,
+               MIN(ph.recordedDate)                          AS firstDate,
+               MAX(ph.recordedDate)                          AS lastDate,
+               MIN(ph.price)                                 AS minPrice,
+               MAX(ph.price)                                 AS maxPrice,
+               first_price.price                             AS firstPrice,
+               last_price.price                              AS lastPrice
+        FROM storeproduct sp
+        JOIN product p ON sp.productID = p.productID
+        LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+        JOIN pricehistory ph ON ph.storeProductID = sp.storeProductID
+        JOIN (
+            SELECT ph1.storeProductID, ph1.price
+            FROM pricehistory ph1
+            INNER JOIN (
+                SELECT storeProductID, MIN(recordedDate) AS d
+                FROM pricehistory GROUP BY storeProductID
+            ) e ON ph1.storeProductID = e.storeProductID AND ph1.recordedDate = e.d
+        ) first_price ON first_price.storeProductID = sp.storeProductID
+        JOIN (
+            SELECT ph2.storeProductID, ph2.price
+            FROM pricehistory ph2
+            INNER JOIN (
+                SELECT storeProductID, MAX(recordedDate) AS d
+                FROM pricehistory GROUP BY storeProductID
+            ) l ON ph2.storeProductID = l.storeProductID AND ph2.recordedDate = l.d
+        ) last_price ON last_price.storeProductID = sp.storeProductID
+        WHERE sp.storeID = ?
+        GROUP BY sp.storeProductID, p.productName, pc.categoryName, first_price.price, last_price.price
+        ORDER BY p.productName
+    `;
+
+    db.query(query, [storeID], (err, results) => {
+        if (err) {
+            console.error('GET /api/store/:storeID/price-trends error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch price trends' });
         }
         res.status(200).json(results);
     });
