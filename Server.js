@@ -402,6 +402,80 @@ app.get('/api/store/:storeID/price-trends', authenticateToken, (req, res) => {
     });
 });
 
+// D200 (Consumer): Price trend report scoped to the consumer's PREFERRED stores.
+// Returns { hasPreferences: bool, trends: [...] }. If the consumer has no store
+// preferences set, hasPreferences=false so the app can prompt them to set preferences.
+app.get('/api/consumer/:userID/price-trends', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+
+    const prefQuery = `
+        SELECT p.preferenceValue
+        FROM preference p
+        JOIN userpreference up ON p.preferenceID = up.preferenceID
+        WHERE up.userID = ? AND p.preferenceType = 'store'
+    `;
+
+    db.query(prefQuery, [userID], (err, prefRows) => {
+        if (err) {
+            console.error('GET /api/consumer/:userID/price-trends (prefs) error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch preferences' });
+        }
+
+        if (!prefRows || prefRows.length === 0) {
+            return res.status(200).json({ hasPreferences: false, trends: [] });
+        }
+
+        const prefValues = prefRows.map(r => r.preferenceValue);
+        const placeholders = prefValues.map(() => '?').join(',');
+
+        const trendQuery = `
+            SELECT p.productName,
+                   pc.categoryName,
+                   s.storeName,
+                   COUNT(ph.priceHistoryID)                      AS dataPoints,
+                   MIN(ph.recordedDate)                          AS firstDate,
+                   MAX(ph.recordedDate)                          AS lastDate,
+                   MIN(ph.price)                                 AS minPrice,
+                   MAX(ph.price)                                 AS maxPrice,
+                   first_price.price                             AS firstPrice,
+                   last_price.price                              AS lastPrice
+            FROM storeproduct sp
+            JOIN product p ON sp.productID = p.productID
+            JOIN store s ON sp.storeID = s.storeID
+            LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+            JOIN pricehistory ph ON ph.storeProductID = sp.storeProductID
+            JOIN (
+                SELECT ph1.storeProductID, ph1.price
+                FROM pricehistory ph1
+                INNER JOIN (
+                    SELECT storeProductID, MIN(recordedDate) AS d
+                    FROM pricehistory GROUP BY storeProductID
+                ) e ON ph1.storeProductID = e.storeProductID AND ph1.recordedDate = e.d
+            ) first_price ON first_price.storeProductID = sp.storeProductID
+            JOIN (
+                SELECT ph2.storeProductID, ph2.price
+                FROM pricehistory ph2
+                INNER JOIN (
+                    SELECT storeProductID, MAX(recordedDate) AS d
+                    FROM pricehistory GROUP BY storeProductID
+                ) l ON ph2.storeProductID = l.storeProductID AND ph2.recordedDate = l.d
+            ) last_price ON last_price.storeProductID = sp.storeProductID
+            WHERE s.storeName IN (${placeholders}) OR s.storeChain IN (${placeholders})
+            GROUP BY sp.storeProductID, p.productName, pc.categoryName, s.storeName, first_price.price, last_price.price
+            ORDER BY s.storeName, p.productName
+        `;
+
+        const params = prefValues.concat(prefValues);
+        db.query(trendQuery, params, (err2, results) => {
+            if (err2) {
+                console.error('GET /api/consumer/:userID/price-trends (trends) error:', err2.message);
+                return res.status(500).json({ error: 'Failed to fetch price trends' });
+            }
+            res.status(200).json({ hasPreferences: true, trends: results });
+        });
+    });
+});
+
 // Update product price (append-only)
 app.post('/api/product/:storeProductID/price', authenticateToken, (req, res) => {
     const { storeProductID } = req.params;
