@@ -1792,7 +1792,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
 
     // --- 1) List items (+ owner) ---
     const listQuery = `
-        SELECT sl.userID,
+        SELECT sl.consumerID,
                sli.productID, p.productName, COALESCE(sli.quantity, 1) AS quantity
         FROM shoppinglist sl
         LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
@@ -1808,7 +1808,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
             return res.status(404).json({ error: 'List not found' });
         }
 
-        const userID = listRows[0].userID;
+        const userID = listRows[0].consumerID;
         const items = listRows
             .filter(r => r.productID != null)
             .map(r => ({ productID: r.productID, productName: r.productName, quantity: r.quantity }));
