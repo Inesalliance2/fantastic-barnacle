@@ -1441,7 +1441,13 @@ app.get('/api/user/:userID/shopping-lists/archived', authenticateToken, (req, re
     let query = `
         SELECT sl.listID, sl.listName, sl.status, sl.createdDate, sl.archivedDate,
                COALESCE(SUM(sli.quantity), 0) AS itemCount,
-               COALESCE(SUM(sli.priceAtArchive * sli.quantity), 0) AS totalCost
+               COALESCE(SUM(
+                   COALESCE(sli.priceAtArchive, (
+                       SELECT MIN(ph.price) FROM pricehistory ph
+                       JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
+                       WHERE sp.productID = sli.productID AND sp.available = TRUE
+                   ), 0) * sli.quantity
+               ), 0) AS totalCost
         FROM shoppinglist sl
         LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
         WHERE sl.consumerID = ? AND sl.status = 'archived'
