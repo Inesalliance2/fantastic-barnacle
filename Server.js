@@ -1757,3 +1757,393 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
     console.log(`Better Basket API running on port ${PORT}`);
 });
+
+// ===== ROUTE OPTIMISATION (B100 / B200 / B300) =====
+// Server-authoritative: computes candidate shopping routes, baseline, and savings.
+// Additive endpoint — does not modify any existing route.
+app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+    const isRoundTrip = req.body && req.body.isRoundTrip === true;
+
+    // --- Constants (fuel defaults confirmed: consumer fuel fields are NULL in practice) ---
+    const DEFAULT_FUEL_PRICE   = 23.00;  // R/L
+    const DEFAULT_CONSUMPTION  = 7.5;    // L/100km
+    const DEFAULT_MAX_DISTANCE = 10;     // km
+    const AVG_SPEED_KMH        = 40;     // travel-time model (no Directions API)
+    const GAMMA_RAND_PER_MIN   = 0.15;   // Balanced Score time weight (Rand/min)
+    const MAX_STORES_PER_ROUTE = 3;
+    const MAX_CANDIDATES       = 3;
+
+    // --- Helpers ---
+    const toRad = (d) => (d * Math.PI) / 180;
+    function haversineKm(lat1, lng1, lat2, lng2) {
+        const R = 6371;
+        const dLat = toRad(lat2 - lat1);
+        const dLng = toRad(lng2 - lng1);
+        const a = Math.sin(dLat / 2) ** 2 +
+            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+        return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    }
+    // Mirrors DiscountUtils.applyDiscount semantics (active-only percent off)
+    function effectivePrice(price, discountPct) {
+        if (!discountPct || discountPct <= 0) return price;
+        return price * (1 - discountPct / 100);
+    }
+
+    // --- 1) List items (+ owner) ---
+    const listQuery = `
+        SELECT sl.userID,
+               sli.productID, p.productName, COALESCE(sli.quantity, 1) AS quantity
+        FROM shoppinglist sl
+        LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
+        LEFT JOIN product p ON sli.productID = p.productID
+        WHERE sl.listID = ?
+    `;
+    db.query(listQuery, [listID], (errList, listRows) => {
+        if (errList) {
+            console.error('optimize-route (list) error:', errList.message);
+            return res.status(500).json({ error: 'Failed to load shopping list' });
+        }
+        if (!listRows || listRows.length === 0) {
+            return res.status(404).json({ error: 'List not found' });
+        }
+
+        const userID = listRows[0].userID;
+        const items = listRows
+            .filter(r => r.productID != null)
+            .map(r => ({ productID: r.productID, productName: r.productName, quantity: r.quantity }));
+
+        if (items.length === 0) {
+            return res.status(200).json({
+                baseline: null, candidates: [], isRoundTrip,
+                fallbackToBaseline: false, message: 'This list has no items to optimise.'
+            });
+        }
+
+        // --- 2) Consumer row (location, distance, fuel) ---
+        const consumerQuery = `
+            SELECT latitude, longitude, maxTravelDistanceKm,
+                   fuelPricePerLitre, consumptionLitresPer100km
+            FROM consumer WHERE userID = ?
+        `;
+        db.query(consumerQuery, [userID], (errC, cRows) => {
+            if (errC) {
+                console.error('optimize-route (consumer) error:', errC.message);
+                return res.status(500).json({ error: 'Failed to load consumer profile' });
+            }
+            if (!cRows || cRows.length === 0) {
+                return res.status(400).json({ error: 'Consumer profile not found' });
+            }
+            const c = cRows[0];
+            if (c.latitude == null || c.longitude == null) {
+                return res.status(400).json({
+                    error: 'No saved location. Please set your location before optimising a route.'
+                });
+            }
+            const homeLat = Number(c.latitude);
+            const homeLng = Number(c.longitude);
+            const maxDistance = c.maxTravelDistanceKm != null ? Number(c.maxTravelDistanceKm) : DEFAULT_MAX_DISTANCE;
+            const fuelPrice = c.fuelPricePerLitre != null ? Number(c.fuelPricePerLitre) : DEFAULT_FUEL_PRICE;
+            const consumption = c.consumptionLitresPer100km != null ? Number(c.consumptionLitresPer100km) : DEFAULT_CONSUMPTION;
+
+            // --- 3) Store preferences (chain names) ---
+            const prefQuery = `
+                SELECT p.preferenceValue
+                FROM preference p
+                JOIN userpreference up ON p.preferenceID = up.preferenceID
+                WHERE up.userID = ? AND p.preferenceType = 'store'
+            `;
+            db.query(prefQuery, [userID], (errP, prefRows) => {
+                if (errP) {
+                    console.error('optimize-route (prefs) error:', errP.message);
+                    return res.status(500).json({ error: 'Failed to load preferences' });
+                }
+                const preferredChains = (prefRows || []).map(r => r.preferenceValue);
+
+                // --- 4) Candidate stores within range (+ optional chain filter) ---
+                let storeQuery = `
+                    SELECT storeID, storeName, storeChain, latitude, longitude,
+                        (6371 * acos(cos(radians(?)) * cos(radians(latitude)) *
+                        cos(radians(longitude) - radians(?)) + sin(radians(?)) * sin(radians(latitude)))) AS distanceKm
+                    FROM store
+                `;
+                const storeParams = [homeLat, homeLng, homeLat];
+                if (preferredChains.length > 0) {
+                    storeQuery += ` WHERE storeChain IN (${preferredChains.map(() => '?').join(',')})`;
+                    storeParams.push(...preferredChains);
+                }
+                storeQuery += ` HAVING distanceKm <= ? ORDER BY distanceKm`;
+                storeParams.push(maxDistance);
+
+                db.query(storeQuery, storeParams, (errS, storeRows) => {
+                    if (errS) {
+                        console.error('optimize-route (stores) error:', errS.message);
+                        return res.status(500).json({ error: 'Failed to load candidate stores' });
+                    }
+                    if (!storeRows || storeRows.length === 0) {
+                        return res.status(200).json({
+                            baseline: null, candidates: [], isRoundTrip,
+                            fallbackToBaseline: false,
+                            message: 'No stores found within your travel distance. Try increasing your max distance or clearing store preferences.'
+                        });
+                    }
+
+                    const candidateStores = storeRows.map(s => ({
+                        storeID: s.storeID, storeName: s.storeName, storeChain: s.storeChain,
+                        latitude: Number(s.latitude), longitude: Number(s.longitude),
+                        distanceKm: Number(s.distanceKm)
+                    }));
+                    const storeIDs = candidateStores.map(s => s.storeID);
+
+                    // --- 5) Store products with latest price (derived-table pattern) ---
+                    const productIDs = items.map(i => i.productID);
+                    const spQuery = `
+                        SELECT sp.storeProductID, sp.storeID, sp.productID, latest.price
+                        FROM storeproduct sp
+                        LEFT JOIN (
+                            SELECT ph.storeProductID, ph.price, ph.recordedDate
+                            FROM pricehistory ph
+                            INNER JOIN (
+                                SELECT storeProductID, MAX(recordedDate) AS maxDate
+                                FROM pricehistory GROUP BY storeProductID
+                            ) ld ON ph.storeProductID = ld.storeProductID AND ph.recordedDate = ld.maxDate
+                        ) latest ON sp.storeProductID = latest.storeProductID
+                        WHERE sp.available = TRUE
+                          AND sp.storeID IN (${storeIDs.map(() => '?').join(',')})
+                          AND sp.productID IN (${productIDs.map(() => '?').join(',')})
+                    `;
+                    db.query(spQuery, [...storeIDs, ...productIDs], (errSP, spRows) => {
+                        if (errSP) {
+                            console.error('optimize-route (storeproducts) error:', errSP.message);
+                            return res.status(500).json({ error: 'Failed to load store products' });
+                        }
+
+                        // --- 6) Active discounts for those storeProducts ---
+                        const spIDs = (spRows || []).map(r => r.storeProductID);
+                        if (spIDs.length === 0) {
+                            return res.status(200).json({
+                                baseline: null, candidates: [], isRoundTrip,
+                                fallbackToBaseline: false,
+                                message: 'None of your list items are available at nearby stores.'
+                            });
+                        }
+                        const discQuery = `
+                            SELECT storeProductID, discountPercent
+                            FROM discountoffer
+                            WHERE CURDATE() BETWEEN startDate AND endDate
+                              AND storeProductID IN (${spIDs.map(() => '?').join(',')})
+                        `;
+                        db.query(discQuery, spIDs, (errD, discRows) => {
+                            if (errD) {
+                                console.error('optimize-route (discounts) error:', errD.message);
+                                return res.status(500).json({ error: 'Failed to load discounts' });
+                            }
+
+                            const discountBySp = {};
+                            (discRows || []).forEach(d => { discountBySp[d.storeProductID] = Number(d.discountPercent); });
+
+                            // priceMap[storeID][productID] = effective unit price
+                            const priceMap = {};
+                            (spRows || []).forEach(r => {
+                                if (r.price == null) return; // no price history → skip
+                                const eff = effectivePrice(Number(r.price), discountBySp[r.storeProductID]);
+                                if (!priceMap[r.storeID]) priceMap[r.storeID] = {};
+                                priceMap[r.storeID][r.productID] = eff;
+                            });
+
+                            // ---------- Compute per-store coverage + basket ----------
+                            const totalQty = items.reduce((s, i) => s + i.quantity, 0);
+                            function storeItemCost(storeID) {
+                                // returns { covered:Set, cost:number }
+                                const covered = new Set();
+                                let cost = 0;
+                                const pm = priceMap[storeID] || {};
+                                for (const it of items) {
+                                    if (pm[it.productID] != null) {
+                                        covered.add(it.productID);
+                                        cost += pm[it.productID] * it.quantity;
+                                    }
+                                }
+                                return { covered, cost };
+                            }
+
+                            // ---------- BASELINE (B300) ----------
+                            // Highest coverage %, tie-break lower total price.
+                            let baseline = null;
+                            for (const s of candidateStores) {
+                                const { covered, cost } = storeItemCost(s.storeID);
+                                const coveredQty = items.filter(i => covered.has(i.productID))
+                                    .reduce((sum, i) => sum + i.quantity, 0);
+                                const coveragePct = totalQty > 0 ? Math.round((coveredQty / totalQty) * 100) : 0;
+                                const dist = isRoundTrip ? s.distanceKm * 2 : s.distanceKm;
+                                const fuel = dist * (consumption / 100) * fuelPrice;
+                                const cand = {
+                                    store: s, coveragePct, groceries: cost,
+                                    fuel, totalCost: cost + fuel
+                                };
+                                if (!baseline) baseline = cand;
+                                else if (cand.coveragePct > baseline.coveragePct) baseline = cand;
+                                else if (cand.coveragePct === baseline.coveragePct && cand.totalCost < baseline.totalCost) baseline = cand;
+                            }
+                            const baselineGroceries = baseline.groceries;
+                            const baselineTotalCost = baseline.totalCost;
+
+                            // ---------- CANDIDATE GENERATION (greedy, <=3 stores) ----------
+                            function bestStoreForUncovered(uncoveredIDs, chosenSet) {
+                                let best = null;
+                                for (const s of candidateStores) {
+                                    if (chosenSet.has(s.storeID)) continue;
+                                    const pm = priceMap[s.storeID] || {};
+                                    let newCoverQty = 0, addCost = 0;
+                                    for (const it of items) {
+                                        if (uncoveredIDs.has(it.productID) && pm[it.productID] != null) {
+                                            newCoverQty += it.quantity;
+                                            addCost += pm[it.productID] * it.quantity;
+                                        }
+                                    }
+                                    if (newCoverQty === 0) continue;
+                                    if (!best || newCoverQty > best.newCoverQty ||
+                                        (newCoverQty === best.newCoverQty && addCost < best.addCost)) {
+                                        best = { store: s, newCoverQty, addCost };
+                                    }
+                                }
+                                return best;
+                            }
+
+                            function buildGreedy(seedStore) {
+                                const chosen = [];
+                                const chosenSet = new Set();
+                                const uncovered = new Set(items.map(i => i.productID));
+                                if (seedStore) {
+                                    chosen.push(seedStore); chosenSet.add(seedStore.storeID);
+                                    const pm = priceMap[seedStore.storeID] || {};
+                                    for (const it of items) if (pm[it.productID] != null) uncovered.delete(it.productID);
+                                }
+                                while (chosen.length < MAX_STORES_PER_ROUTE && uncovered.size > 0) {
+                                    const add = bestStoreForUncovered(uncovered, chosenSet);
+                                    if (!add) break;
+                                    chosen.push(add.store); chosenSet.add(add.store.storeID);
+                                    const pm = priceMap[add.store.storeID] || {};
+                                    for (const it of items) if (pm[it.productID] != null) uncovered.delete(it.productID);
+                                }
+                                return chosen;
+                            }
+
+                            // Strategy seeds
+                            const cheapestSeed = [...candidateStores].sort((a, b) =>
+                                storeItemCost(a.storeID).cost - storeItemCost(b.storeID).cost)[0];
+                            const closestSeed = candidateStores[0]; // already sorted by distance
+                            const seeds = [null, cheapestSeed, closestSeed]; // S1 best-coverage, S2 cheapest, S3 closest
+
+                            const rawCandidates = seeds.map(buildGreedy);
+
+                            // De-duplicate by store-set signature
+                            const seen = new Set();
+                            const uniqueStoreSets = [];
+                            for (const set of rawCandidates) {
+                                const sig = set.map(s => s.storeID).sort((a, b) => a - b).join(',');
+                                if (set.length > 0 && !seen.has(sig)) { seen.add(sig); uniqueStoreSets.push(set); }
+                            }
+
+                            // ---------- METRICS + SCORING per candidate ----------
+                            function assembleCandidate(storeSet) {
+                                // assign each item to cheapest store in the set that stocks it
+                                const assignment = {}; // storeID -> [{productName, quantity, effectivePrice}]
+                                const uncoveredItems = [];
+                                let groceriesTotal = 0;
+                                for (const it of items) {
+                                    let bestStoreID = null, bestPrice = Infinity;
+                                    for (const s of storeSet) {
+                                        const pm = priceMap[s.storeID] || {};
+                                        if (pm[it.productID] != null && pm[it.productID] < bestPrice) {
+                                            bestPrice = pm[it.productID]; bestStoreID = s.storeID;
+                                        }
+                                    }
+                                    if (bestStoreID == null) { uncoveredItems.push(it.productName); continue; }
+                                    if (!assignment[bestStoreID]) assignment[bestStoreID] = [];
+                                    assignment[bestStoreID].push({
+                                        productName: it.productName, quantity: it.quantity,
+                                        effectivePrice: Math.round(bestPrice * 100) / 100
+                                    });
+                                    groceriesTotal += bestPrice * it.quantity;
+                                }
+
+                                // stops in visit order (nearest-first among used stores)
+                                const usedStores = storeSet.filter(s => assignment[s.storeID])
+                                    .sort((a, b) => a.distanceKm - b.distanceKm);
+
+                                let distanceKm = 0;
+                                let prevLat = homeLat, prevLng = homeLng;
+                                const stops = [];
+                                usedStores.forEach((s, idx) => {
+                                    distanceKm += haversineKm(prevLat, prevLng, s.latitude, s.longitude);
+                                    prevLat = s.latitude; prevLng = s.longitude;
+                                    stops.push({
+                                        order: idx + 1, storeID: s.storeID, storeName: s.storeName,
+                                        latitude: s.latitude, longitude: s.longitude,
+                                        items: assignment[s.storeID]
+                                    });
+                                });
+                                if (isRoundTrip) distanceKm *= 2;
+
+                                const fuelCost = distanceKm * (consumption / 100) * fuelPrice;
+                                const travelTimeMin = (distanceKm / AVG_SPEED_KMH) * 60;
+                                const basketSavings = baselineGroceries - groceriesTotal;
+                                const balancedScore = basketSavings - (fuelCost + GAMMA_RAND_PER_MIN * travelTimeMin);
+                                const totalCost = groceriesTotal + fuelCost;
+                                const savingsVsBaseline = baselineTotalCost - totalCost;
+                                const coveredQty = totalQty - items
+                                    .filter(i => uncoveredItems.includes(i.productName))
+                                    .reduce((sum, i) => sum + i.quantity, 0);
+                                const coveragePct = totalQty > 0 ? Math.round((coveredQty / totalQty) * 100) : 0;
+
+                                const r2 = (n) => Math.round(n * 100) / 100;
+                                return {
+                                    balancedScore: r2(balancedScore),
+                                    groceriesTotal: r2(groceriesTotal),
+                                    distanceKm: r2(distanceKm),
+                                    fuelCost: r2(fuelCost),
+                                    travelTimeMin: r2(travelTimeMin),
+                                    totalCost: r2(totalCost),
+                                    savingsVsBaseline: r2(savingsVsBaseline),
+                                    coveragePct,
+                                    uncoveredItems,
+                                    stops
+                                };
+                            }
+
+                            let candidates = uniqueStoreSets.map(assembleCandidate)
+                                .sort((a, b) => b.balancedScore - a.balancedScore)
+                                .slice(0, MAX_CANDIDATES);
+                            candidates.forEach((c2, i) => { c2.rank = i + 1; });
+
+                            // ---------- Negative-savings fallback (B300 alt flow) ----------
+                            let fallbackToBaseline = false;
+                            let message = null;
+                            if (candidates.length === 0 || candidates[0].savingsVsBaseline < 0) {
+                                fallbackToBaseline = true;
+                                message = 'Shopping at your nearest store is already the best option.';
+                            }
+
+                            return res.status(200).json({
+                                consumerLocation: { latitude: homeLat, longitude: homeLng },
+                                baseline: {
+                                    storeID: baseline.store.storeID,
+                                    storeName: baseline.store.storeName,
+                                    groceriesTotal: Math.round(baselineGroceries * 100) / 100,
+                                    fuelCost: Math.round(baseline.fuel * 100) / 100,
+                                    totalCost: Math.round(baselineTotalCost * 100) / 100,
+                                    coveragePct: baseline.coveragePct
+                                },
+                                candidates,
+                                isRoundTrip,
+                                fallbackToBaseline,
+                                message
+                            });
+                        });
+                    });
+                });
+            });
+        });
+    });
+});
