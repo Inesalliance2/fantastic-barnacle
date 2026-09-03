@@ -1212,6 +1212,506 @@ app.get('/api/storeproduct/:storeProductID/pricehistory', authenticateToken, (re
     });
 });
 
+// ============================================================
+// A-SERIES: Shopping List & Store Summary (A200–A1000)
+// Owner: Nicholas Hargreaves
+// Additive block — introduces only new routes; does not modify any
+// existing endpoints. A100 (product search) is intentionally NOT included
+// here because /api/product/search already exists (C-series).
+// ============================================================
+
+// A200 — Get the consumer's active shopping list (summary only).
+app.get('/api/user/:userID/shopping-list', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+
+    const query = `
+        SELECT sl.listID, sl.listName, sl.status, sl.createdDate, sl.lastModifiedDate,
+               COALESCE(SUM(sli.quantity), 0) AS itemCount,
+               COUNT(DISTINCT p.categoryID) AS categoryCount,
+               COALESCE(SUM(
+                   COALESCE((
+                       SELECT MIN(ph.price) FROM pricehistory ph
+                       JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
+                       WHERE sp.productID = sli.productID AND sp.available = TRUE
+                   ), 0) * sli.quantity
+               ), 0) AS baselineSubtotal
+        FROM shoppinglist sl
+        LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
+        LEFT JOIN product p ON sli.productID = p.productID
+        WHERE sl.userID = ? AND sl.status = 'active'
+        GROUP BY sl.listID, sl.listName, sl.status, sl.createdDate, sl.lastModifiedDate
+        ORDER BY sl.lastModifiedDate DESC
+        LIMIT 1
+    `;
+
+    db.query(query, [userID], (err, results) => {
+        if (err) {
+            console.error('GET /api/user/:userID/shopping-list error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch shopping list' });
+        }
+        if (results.length === 0) {
+            return res.status(200).json({ listID: 0, listName: null, status: null, itemCount: 0, categoryCount: 0, baselineSubtotal: 0 });
+        }
+        res.status(200).json(results[0]);
+    });
+});
+
+// A200 — Create a new active shopping list.
+// Business rule (A200 AC1/AC6): a consumer may have only ONE active list at a
+// time. If one already exists, reject with 409 so the client prompts the user
+// to archive it first rather than silently creating a second active list.
+app.post('/api/user/:userID/shopping-list', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    const { listName } = req.body;
+    const name = listName || 'My Shopping List';
+
+    db.query(
+        'SELECT listID FROM shoppinglist WHERE userID = ? AND status = \'active\' LIMIT 1',
+        [userID],
+        (errCheck, existing) => {
+            if (errCheck) {
+                console.error('POST /api/user/:userID/shopping-list (check) error:', errCheck.message);
+                return res.status(500).json({ error: 'Failed to create shopping list' });
+            }
+            if (existing.length > 0) {
+                return res.status(409).json({
+                    error: 'An active shopping list already exists. Archive it before creating a new one.',
+                    listID: existing[0].listID
+                });
+            }
+
+            db.query(
+                'INSERT INTO shoppinglist (userID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                [userID, name],
+                (err, result) => {
+                    if (err) {
+                        console.error('POST /api/user/:userID/shopping-list error:', err.message);
+                        return res.status(500).json({ error: 'Failed to create shopping list' });
+                    }
+                    res.status(201).json({ message: 'Shopping list created', listID: result.insertId, listName: name });
+                }
+            );
+        }
+    );
+});
+
+// A300 — Add an item to a list (increments quantity if it already exists).
+app.post('/api/shopping-list/:listID/items', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+    const { productID, quantity } = req.body;
+
+    if (!productID || !quantity || quantity < 1 || quantity > 99) {
+        return res.status(400).json({ error: 'Valid productID and quantity (1-99) required' });
+    }
+
+    db.query('SELECT quantity FROM shoppinglistitem WHERE listID = ? AND productID = ?', [listID, productID], (err, existing) => {
+        if (err) {
+            console.error('POST /api/shopping-list/:listID/items error:', err.message);
+            return res.status(500).json({ error: 'Failed to add item' });
+        }
+
+        if (existing.length > 0) {
+            const newQty = Math.min(99, existing[0].quantity + quantity);
+            db.query('UPDATE shoppinglistitem SET quantity = ? WHERE listID = ? AND productID = ?', [newQty, listID, productID], (err2) => {
+                if (err2) {
+                    return res.status(500).json({ error: 'Failed to update item quantity' });
+                }
+                db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [listID]);
+                res.status(200).json({ message: 'Item already on list — quantity updated', isDuplicate: true, productID, quantity: newQty });
+            });
+        } else {
+            db.query('INSERT INTO shoppinglistitem (listID, productID, quantity, addedDate) VALUES (?, ?, ?, NOW())', [listID, productID, quantity], (err2) => {
+                if (err2) {
+                    return res.status(500).json({ error: 'Failed to add item' });
+                }
+                db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [listID]);
+                res.status(201).json({ message: 'Item added to list', isDuplicate: false, productID, quantity });
+            });
+        }
+    });
+});
+
+// A500 — Update the quantity of an item on a list.
+app.put('/api/shopping-list/:listID/items/:productID', authenticateToken, (req, res) => {
+    const { listID, productID } = req.params;
+    const { quantity } = req.body;
+
+    if (!quantity || quantity < 1 || quantity > 99) {
+        return res.status(400).json({ error: 'Valid quantity (1-99) required' });
+    }
+
+    db.query('UPDATE shoppinglistitem SET quantity = ? WHERE listID = ? AND productID = ?', [quantity, listID, productID], (err, result) => {
+        if (err) {
+            console.error('PUT /api/shopping-list/:listID/items/:productID error:', err.message);
+            return res.status(500).json({ error: 'Failed to update quantity' });
+        }
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Item not found' });
+        }
+        db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [listID]);
+        res.status(200).json({ message: 'Quantity updated', productID: parseInt(productID), quantity });
+    });
+});
+
+// A400 — Remove an item from a list.
+app.delete('/api/shopping-list/:listID/items/:productID', authenticateToken, (req, res) => {
+    const { listID, productID } = req.params;
+
+    db.query('DELETE FROM shoppinglistitem WHERE listID = ? AND productID = ?', [listID, productID], (err, result) => {
+        if (err) {
+            console.error('DELETE /api/shopping-list/:listID/items/:productID error:', err.message);
+            return res.status(500).json({ error: 'Failed to remove item' });
+        }
+        if (result.affectedRows === 0) {
+            return res.status(404).json({ error: 'Item not found' });
+        }
+        db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [listID]);
+        res.status(200).json({ message: 'Item removed from list', productID: parseInt(productID) });
+    });
+});
+
+// A700 — Archive a list. Snapshots the current lowest available price of each
+// item into priceAtArchive so archived totals stay accurate over time.
+app.put('/api/shopping-list/:listID/archive', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+
+    const snapshotQuery = `
+        UPDATE shoppinglistitem sli
+        SET sli.priceAtArchive = (
+            SELECT MIN(ph.price) FROM pricehistory ph
+            JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
+            WHERE sp.productID = sli.productID AND sp.available = TRUE
+        )
+        WHERE sli.listID = ?
+    `;
+
+    db.query(snapshotQuery, [listID], (err) => {
+        if (err) {
+            console.error('PUT /api/shopping-list/:listID/archive (snapshot) error:', err.message);
+            return res.status(500).json({ error: 'Failed to archive list' });
+        }
+        db.query('UPDATE shoppinglist SET status = \'archived\', archivedDate = NOW() WHERE listID = ? AND status = \'active\'', [listID], (err2, result) => {
+            if (err2) {
+                console.error('PUT /api/shopping-list/:listID/archive error:', err2.message);
+                return res.status(500).json({ error: 'Failed to archive list' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Active list not found' });
+            }
+            res.status(200).json({ message: 'List archived successfully', listID: parseInt(listID) });
+        });
+    });
+});
+
+// A800 — Get archived lists for a user, with optional sort/order/days filters.
+app.get('/api/user/:userID/shopping-lists/archived', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    const { sort, order, days } = req.query;
+
+    let query = `
+        SELECT sl.listID, sl.listName, sl.status, sl.createdDate, sl.archivedDate,
+               COALESCE(SUM(sli.quantity), 0) AS itemCount,
+               COALESCE(SUM(sli.priceAtArchive * sli.quantity), 0) AS totalCost
+        FROM shoppinglist sl
+        LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
+        WHERE sl.userID = ? AND sl.status = 'archived'
+    `;
+    const params = [userID];
+
+    if (days && days !== 'all') {
+        query += ' AND sl.archivedDate >= DATE_SUB(NOW(), INTERVAL ? DAY)';
+        params.push(parseInt(days));
+    }
+
+    query += ' GROUP BY sl.listID, sl.listName, sl.status, sl.createdDate, sl.archivedDate';
+
+    const dir = order === 'asc' ? 'ASC' : 'DESC';
+    if (sort === 'cost') {
+        query += ` ORDER BY totalCost ${dir}`;
+    } else {
+        query += ` ORDER BY sl.archivedDate ${dir}`;
+    }
+
+    db.query(query, params, (err, results) => {
+        if (err) {
+            console.error('GET /api/user/:userID/shopping-lists/archived error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch archived lists' });
+        }
+        res.status(200).json(results);
+    });
+});
+
+// A600 / A800 — Get full details of a list (active or archived), including a
+// per-item discount indicator (isOnDiscount) and computed summary metrics.
+app.get('/api/shopping-list/:listID/details', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+
+    const query = `
+        SELECT sl.listID, sl.listName, sl.status, sl.createdDate, sl.lastModifiedDate, sl.archivedDate,
+               sli.productID, p.productName, p.brand, p.typicalUnit, pc.categoryName,
+               sli.quantity, sli.priceAtArchive,
+               (SELECT MIN(ph.price) FROM pricehistory ph
+                JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
+                WHERE sp.productID = sli.productID AND sp.available = TRUE) AS lowestPrice,
+               (SELECT COUNT(*) FROM discountoffer d
+                JOIN storeproduct sp2 ON d.storeProductID = sp2.storeProductID
+                WHERE sp2.productID = sli.productID
+                  AND CURDATE() BETWEEN d.startDate AND d.endDate) AS activeDiscounts
+        FROM shoppinglist sl
+        LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
+        LEFT JOIN product p ON sli.productID = p.productID
+        LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+        WHERE sl.listID = ?
+    `;
+
+    db.query(query, [listID], (err, results) => {
+        if (err) {
+            console.error('GET /api/shopping-list/:listID/details error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch list details' });
+        }
+        if (results.length === 0) {
+            return res.status(404).json({ error: 'List not found' });
+        }
+
+        const list = {
+            listID: results[0].listID,
+            listName: results[0].listName,
+            status: results[0].status,
+            createdDate: results[0].createdDate,
+            lastModifiedDate: results[0].lastModifiedDate,
+            archivedDate: results[0].archivedDate,
+            items: results.filter(r => r.productID).map(r => ({
+                productID: r.productID,
+                productName: r.productName,
+                brand: r.brand,
+                typicalUnit: r.typicalUnit,
+                categoryName: r.categoryName,
+                quantity: r.quantity,
+                lowestPrice: r.lowestPrice,
+                priceAtArchive: r.priceAtArchive,
+                isOnDiscount: r.activeDiscounts > 0
+            }))
+        };
+
+        list.itemCount = list.items.reduce((sum, item) => sum + item.quantity, 0);
+        list.categoryCount = new Set(list.items.map(i => i.categoryName)).size;
+        list.baselineSubtotal = list.items.reduce((sum, item) => sum + (item.lowestPrice || 0) * item.quantity, 0);
+
+        res.status(200).json(list);
+    });
+});
+
+// A900 — Copy an archived list into an active list.
+// - Archived prices are NOT carried over; the active list uses live prices.
+// - Items no longer available at ANY store are excluded and reported back.
+// - mode: 'merge' folds items into the user's existing active list (creating
+//   one if none); 'replace' (default) archives existing active lists first.
+app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+    const { userID, mode } = req.body;
+
+    if (!userID) {
+        return res.status(400).json({ error: 'userID is required' });
+    }
+
+    const copyMode = mode === 'merge' ? 'merge' : 'replace';
+
+    const itemQuery = `
+        SELECT sli.productID, sli.quantity, p.productName,
+               (SELECT COUNT(*) FROM storeproduct sp
+                WHERE sp.productID = sli.productID AND sp.available = TRUE) AS availableCount
+        FROM shoppinglistitem sli
+        LEFT JOIN product p ON sli.productID = p.productID
+        WHERE sli.listID = ?
+    `;
+
+    db.query(itemQuery, [listID], (err, items) => {
+        if (err) {
+            console.error('POST /api/shopping-list/:listID/copy error:', err.message);
+            return res.status(500).json({ error: 'Failed to copy list' });
+        }
+
+        const availableItems = items.filter(i => i.availableCount > 0);
+        const unavailableItems = items
+            .filter(i => i.availableCount === 0)
+            .map(i => ({ productID: i.productID, productName: i.productName, reason: 'No longer available at any store' }));
+
+        const populateList = (targetListID) => {
+            if (availableItems.length === 0) {
+                return res.status(201).json({
+                    message: 'List copied (no available items)',
+                    newListID: targetListID,
+                    copiedItems: 0,
+                    unavailableItems
+                });
+            }
+
+            const values = availableItems.map(i => [targetListID, i.productID, i.quantity]);
+            const placeholders = values.map(() => '(?, ?, ?, NOW())').join(', ');
+            const flatValues = values.flat();
+
+            const insertSql = `
+                INSERT INTO shoppinglistitem (listID, productID, quantity, addedDate)
+                VALUES ${placeholders}
+                ON DUPLICATE KEY UPDATE quantity = LEAST(99, quantity + VALUES(quantity))
+            `;
+
+            db.query(insertSql, flatValues, (err3) => {
+                if (err3) {
+                    console.error('POST /api/shopping-list/:listID/copy (insert) error:', err3.message);
+                    return res.status(500).json({ error: 'Failed to copy items' });
+                }
+                db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [targetListID]);
+                res.status(201).json({
+                    message: 'List copied successfully',
+                    newListID: targetListID,
+                    copiedItems: availableItems.length,
+                    unavailableItems
+                });
+            });
+        };
+
+        if (copyMode === 'merge') {
+            db.query(
+                'SELECT listID FROM shoppinglist WHERE userID = ? AND status = \'active\' ORDER BY lastModifiedDate DESC LIMIT 1',
+                [userID],
+                (errM, activeRows) => {
+                    if (errM) {
+                        return res.status(500).json({ error: 'Failed to copy list' });
+                    }
+                    if (activeRows.length > 0) {
+                        return populateList(activeRows[0].listID);
+                    }
+                    db.query(
+                        'INSERT INTO shoppinglist (userID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                        [userID, 'Copied List'],
+                        (errC, created) => {
+                            if (errC) {
+                                return res.status(500).json({ error: 'Failed to create new list' });
+                            }
+                            populateList(created.insertId);
+                        }
+                    );
+                }
+            );
+        } else {
+            // replace: snapshot prices on any existing active lists (so their
+            // archived totals stay accurate, consistent with the A700 archive
+            // flow), archive them, then create a fresh active list.
+            const snapshotExistingSql = `
+                UPDATE shoppinglistitem sli
+                JOIN shoppinglist sl ON sli.listID = sl.listID
+                SET sli.priceAtArchive = (
+                    SELECT MIN(ph.price) FROM pricehistory ph
+                    JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
+                    WHERE sp.productID = sli.productID AND sp.available = TRUE
+                )
+                WHERE sl.userID = ? AND sl.status = 'active'
+            `;
+
+            db.query(snapshotExistingSql, [userID], (errS) => {
+                if (errS) {
+                    console.error('POST /api/shopping-list/:listID/copy (replace snapshot) error:', errS.message);
+                    return res.status(500).json({ error: 'Failed to copy list' });
+                }
+                db.query(
+                    'UPDATE shoppinglist SET status = \'archived\', archivedDate = NOW() WHERE userID = ? AND status = \'active\'',
+                    [userID],
+                    (errR) => {
+                        if (errR) {
+                            return res.status(500).json({ error: 'Failed to copy list' });
+                        }
+                        db.query(
+                            'INSERT INTO shoppinglist (userID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                            [userID, 'Copied List'],
+                            (err2, result) => {
+                                if (err2) {
+                                    return res.status(500).json({ error: 'Failed to create new list' });
+                                }
+                                populateList(result.insertId);
+                            }
+                        );
+                    }
+                );
+            });
+        }
+    });
+});
+
+// A1000 — Store summary: store record + coordinates, product count, active
+// discount count, and (if userID given) how many of the consumer's active-list
+// items are stocked here. distanceKm is left null for the client to compute.
+app.get('/api/store/:storeID/summary', authenticateToken, (req, res) => {
+    const { storeID } = req.params;
+    const { userID } = req.query;
+
+    db.query('SELECT * FROM store WHERE storeID = ?', [storeID], (err, storeRows) => {
+        if (err) {
+            console.error('GET /api/store/:storeID/summary error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch store summary' });
+        }
+        if (storeRows.length === 0) {
+            return res.status(404).json({ error: 'Store not found' });
+        }
+
+        const store = storeRows[0];
+
+        const countsQuery = `
+            SELECT
+                (SELECT COUNT(*) FROM storeproduct sp
+                 WHERE sp.storeID = ? AND sp.available = TRUE) AS productCount,
+                (SELECT COUNT(*) FROM discountoffer d
+                 JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
+                 WHERE sp.storeID = ? AND CURDATE() BETWEEN d.startDate AND d.endDate) AS activeDiscountCount
+        `;
+
+        db.query(countsQuery, [storeID, storeID], (err2, countRows) => {
+            if (err2) {
+                console.error('GET /api/store/:storeID/summary (counts) error:', err2.message);
+                return res.status(500).json({ error: 'Failed to fetch store summary' });
+            }
+
+            const counts = countRows[0] || { productCount: 0, activeDiscountCount: 0 };
+
+            const respond = (matchingListItems) => {
+                res.status(200).json({
+                    storeID: store.storeID,
+                    storeName: store.storeName,
+                    storeChain: store.storeChain,
+                    location: store.location,
+                    latitude: store.latitude !== undefined ? store.latitude : null,
+                    longitude: store.longitude !== undefined ? store.longitude : null,
+                    openingHours: store.openingHours,
+                    productCount: counts.productCount,
+                    activeDiscountCount: counts.activeDiscountCount,
+                    matchingListItems,
+                    distanceKm: null
+                });
+            };
+
+            if (!userID) {
+                return respond(0);
+            }
+
+            const matchQuery = `
+                SELECT COUNT(DISTINCT sli.productID) AS matchingListItems
+                FROM shoppinglist sl
+                JOIN shoppinglistitem sli ON sl.listID = sli.listID
+                JOIN storeproduct sp ON sp.productID = sli.productID
+                    AND sp.storeID = ? AND sp.available = TRUE
+                WHERE sl.userID = ? AND sl.status = 'active'
+            `;
+
+            db.query(matchQuery, [storeID, userID], (err3, matchRows) => {
+                if (err3) {
+                    return respond(0);
+                }
+                respond(matchRows[0] ? matchRows[0].matchingListItems : 0);
+            });
+        });
+    });
+});
+
 // Start server
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
