@@ -1851,7 +1851,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                 SELECT p.preferenceValue
                 FROM preference p
                 JOIN userpreference up ON p.preferenceID = up.preferenceID
-                WHERE up.userID = ? AND p.preferenceType = 'store'
+                WHERE up.consumerID = ? AND p.preferenceType = 'store'
             `;
             db.query(prefQuery, [userID], (errP, prefRows) => {
                 if (errP) {
