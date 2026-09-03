@@ -1320,13 +1320,20 @@ app.post('/api/shopping-list/:listID/items', authenticateToken, (req, res) => {
                 res.status(200).json({ message: 'Item already on list — quantity updated', isDuplicate: true, productID, quantity: newQty });
             });
         } else {
-            db.query('INSERT INTO shoppinglistitem (listID, productID, quantity, addedDate) VALUES (?, ?, ?, NOW())', [listID, productID, quantity], (err2) => {
-                if (err2) {
-                    return res.status(500).json({ error: 'Failed to add item' });
+            // shoppinglistitem.userID is NOT NULL; derive it from the parent
+            // list's consumerID so the row satisfies the schema constraint.
+            db.query(
+                'INSERT INTO shoppinglistitem (listID, userID, productID, quantity, addedDate) SELECT ?, sl.consumerID, ?, ?, NOW() FROM shoppinglist sl WHERE sl.listID = ?',
+                [listID, productID, quantity, listID],
+                (err2) => {
+                    if (err2) {
+                        console.error('POST /api/shopping-list/:listID/items (insert) error:', err2.message);
+                        return res.status(500).json({ error: 'Failed to add item' });
+                    }
+                    db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [listID]);
+                    res.status(201).json({ message: 'Item added to list', isDuplicate: false, productID, quantity });
                 }
-                db.query('UPDATE shoppinglist SET lastModifiedDate = NOW() WHERE listID = ?', [listID]);
-                res.status(201).json({ message: 'Item added to list', isDuplicate: false, productID, quantity });
-            });
+            );
         }
     });
 });
@@ -1546,12 +1553,14 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
                 });
             }
 
-            const values = availableItems.map(i => [targetListID, i.productID, i.quantity]);
-            const placeholders = values.map(() => '(?, ?, ?, NOW())').join(', ');
+            // shoppinglistitem.userID is NOT NULL; populate it with the target
+            // list's owner (the requesting consumer) to satisfy the constraint.
+            const values = availableItems.map(i => [targetListID, userID, i.productID, i.quantity]);
+            const placeholders = values.map(() => '(?, ?, ?, ?, NOW())').join(', ');
             const flatValues = values.flat();
 
             const insertSql = `
-                INSERT INTO shoppinglistitem (listID, productID, quantity, addedDate)
+                INSERT INTO shoppinglistitem (listID, userID, productID, quantity, addedDate)
                 VALUES ${placeholders}
                 ON DUPLICATE KEY UPDATE quantity = LEAST(99, quantity + VALUES(quantity))
             `;
