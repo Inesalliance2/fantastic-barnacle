@@ -1238,7 +1238,7 @@ app.get('/api/user/:userID/shopping-list', authenticateToken, (req, res) => {
         FROM shoppinglist sl
         LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
         LEFT JOIN product p ON sli.productID = p.productID
-        WHERE sl.userID = ? AND sl.status = 'active'
+        WHERE sl.consumerID = ? AND sl.status = 'active'
         GROUP BY sl.listID, sl.listName, sl.status, sl.createdDate, sl.lastModifiedDate
         ORDER BY sl.lastModifiedDate DESC
         LIMIT 1
@@ -1266,7 +1266,7 @@ app.post('/api/user/:userID/shopping-list', authenticateToken, (req, res) => {
     const name = listName || 'My Shopping List';
 
     db.query(
-        'SELECT listID FROM shoppinglist WHERE userID = ? AND status = \'active\' LIMIT 1',
+        'SELECT listID FROM shoppinglist WHERE consumerID = ? AND status = \'active\' LIMIT 1',
         [userID],
         (errCheck, existing) => {
             if (errCheck) {
@@ -1281,7 +1281,7 @@ app.post('/api/user/:userID/shopping-list', authenticateToken, (req, res) => {
             }
 
             db.query(
-                'INSERT INTO shoppinglist (userID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
                 [userID, name],
                 (err, result) => {
                     if (err) {
@@ -1414,7 +1414,7 @@ app.get('/api/user/:userID/shopping-lists/archived', authenticateToken, (req, re
                COALESCE(SUM(sli.priceAtArchive * sli.quantity), 0) AS totalCost
         FROM shoppinglist sl
         LEFT JOIN shoppinglistitem sli ON sl.listID = sli.listID
-        WHERE sl.userID = ? AND sl.status = 'archived'
+        WHERE sl.consumerID = ? AND sl.status = 'archived'
     `;
     const params = [userID];
 
@@ -1573,7 +1573,7 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
 
         if (copyMode === 'merge') {
             db.query(
-                'SELECT listID FROM shoppinglist WHERE userID = ? AND status = \'active\' ORDER BY lastModifiedDate DESC LIMIT 1',
+                'SELECT listID FROM shoppinglist WHERE consumerID = ? AND status = \'active\' ORDER BY lastModifiedDate DESC LIMIT 1',
                 [userID],
                 (errM, activeRows) => {
                     if (errM) {
@@ -1583,7 +1583,7 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
                         return populateList(activeRows[0].listID);
                     }
                     db.query(
-                        'INSERT INTO shoppinglist (userID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                        'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
                         [userID, 'Copied List'],
                         (errC, created) => {
                             if (errC) {
@@ -1606,7 +1606,7 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
                     JOIN storeproduct sp ON ph.storeProductID = sp.storeProductID
                     WHERE sp.productID = sli.productID AND sp.available = TRUE
                 )
-                WHERE sl.userID = ? AND sl.status = 'active'
+                WHERE sl.consumerID = ? AND sl.status = 'active'
             `;
 
             db.query(snapshotExistingSql, [userID], (errS) => {
@@ -1615,14 +1615,14 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
                     return res.status(500).json({ error: 'Failed to copy list' });
                 }
                 db.query(
-                    'UPDATE shoppinglist SET status = \'archived\', archivedDate = NOW() WHERE userID = ? AND status = \'active\'',
+                    'UPDATE shoppinglist SET status = \'archived\', archivedDate = NOW() WHERE consumerID = ? AND status = \'active\'',
                     [userID],
                     (errR) => {
                         if (errR) {
                             return res.status(500).json({ error: 'Failed to copy list' });
                         }
                         db.query(
-                            'INSERT INTO shoppinglist (userID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                            'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
                             [userID, 'Copied List'],
                             (err2, result) => {
                                 if (err2) {
@@ -1699,7 +1699,7 @@ app.get('/api/store/:storeID/summary', authenticateToken, (req, res) => {
                 JOIN shoppinglistitem sli ON sl.listID = sli.listID
                 JOIN storeproduct sp ON sp.productID = sli.productID
                     AND sp.storeID = ? AND sp.available = TRUE
-                WHERE sl.userID = ? AND sl.status = 'active'
+                WHERE sl.consumerID = ? AND sl.status = 'active'
             `;
 
             db.query(matchQuery, [storeID, userID], (err3, matchRows) => {
