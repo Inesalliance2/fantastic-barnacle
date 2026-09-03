@@ -193,13 +193,15 @@ app.post('/api/login', (req, res) => {
 app.get('/api/user/:userID', authenticateToken, (req, res) => {
     const { userID } = req.params;
 
-    db.query('SELECT userID, userType, firstName, lastName, email, phone FROM user WHERE userID = ?', [userID], (err, results) => {
+       db.query(`
+        SELECT u.userID, u.userType, u.firstName, u.lastName, u.email, u.phone,
+               c.latitude, c.longitude
+        FROM user u
+        LEFT JOIN consumer c ON u.userID = c.userID
+        WHERE u.userID = ?
+    `, [userID], (err, results) => {
         if (err) {
             return res.status(500).json({ error: 'Failed to fetch user' });
-        }
-
-        if (results.length === 0) {
-            return res.status(404).json({ error: 'User not found' });
         }
 
         res.status(200).json(results[0]);
