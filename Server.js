@@ -1377,6 +1377,29 @@ app.delete('/api/shopping-list/:listID/items/:productID', authenticateToken, (re
     });
 });
 
+// Delete an entire list (active or archived) and all of its items.
+app.delete('/api/shopping-list/:listID', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+
+    // Remove items first to satisfy the FK from shoppinglistitem -> shoppinglist.
+    db.query('DELETE FROM shoppinglistitem WHERE listID = ?', [listID], (err) => {
+        if (err) {
+            console.error('DELETE /api/shopping-list/:listID (items) error:', err.message);
+            return res.status(500).json({ error: 'Failed to delete list' });
+        }
+        db.query('DELETE FROM shoppinglist WHERE listID = ?', [listID], (err2, result) => {
+            if (err2) {
+                console.error('DELETE /api/shopping-list/:listID error:', err2.message);
+                return res.status(500).json({ error: 'Failed to delete list' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'List not found' });
+            }
+            res.status(200).json({ message: 'List deleted successfully', listID: parseInt(listID) });
+        });
+    });
+});
+
 // A700 — Archive a list. Snapshots the current lowest available price of each
 // item into priceAtArchive so archived totals stay accurate over time.
 app.put('/api/shopping-list/:listID/archive', authenticateToken, (req, res) => {
