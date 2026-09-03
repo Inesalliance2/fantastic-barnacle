@@ -52,7 +52,7 @@ app.get('/hello', (req, res) => {
 
 // Register consumer
 app.post('/api/register/consumer', async (req, res) => {
-    const { firstName, lastName, email, phone, password } = req.body;
+         const { firstName, lastName, email, phone, password } = req.body;
 
     if (!firstName || !lastName || !email || !phone || !password) {
         return res.status(400).json({ error: 'All fields are required' });
@@ -164,23 +164,19 @@ app.post('/api/login', (req, res) => {
 
         // For managers, resolve their associated store so the app has a storeID after login
         if (user.userType === 'manager') {
-            db.query('SELECT branchCode FROM manager WHERE userID = ?', [user.userID], (mErr, mRows) => {
-                let storeID = 0;
-                if (!mErr && mRows.length > 0) {
-                    const parsed = parseInt(mRows[0].branchCode, 10);
-                    if (!isNaN(parsed)) storeID = parsed;
-                }
-                res.status(200).json({
-                    message: 'Login successful',
-                    userID: user.userID,
-                    userType: user.userType,
-                    firstName: user.firstName,
-                    lastName: user.lastName,
-                    storeID,
-                    token
-                });
-            });
-        } else {
+    db.query('SELECT storeID FROM manager WHERE userID = ?', [user.userID], (mErr, mRows) => {
+        const storeID = (!mErr && mRows.length > 0) ? mRows[0].storeID : null;
+        res.status(200).json({
+            message: 'Login successful',
+            userID: user.userID,
+            userType: user.userType,
+            firstName: user.firstName,
+            lastName: user.lastName,
+            storeID,
+            token
+        });
+    });
+} else {
             res.status(200).json({
                 message: 'Login successful',
                 userID: user.userID,
@@ -213,7 +209,7 @@ app.get('/api/user/:userID', authenticateToken, (req, res) => {
 // Update user profile
 app.put('/api/user/:userID', authenticateToken, async (req, res) => {
     const { userID } = req.params;
-    const { firstName, lastName, email, phone, password } = req.body;
+       const { firstName, lastName, email, phone, password, latitude, longitude } = req.body;
 
     if (!firstName || !lastName || !email || !phone) {
         return res.status(400).json({ error: 'All fields are required' });
@@ -251,10 +247,21 @@ app.put('/api/user/:userID', authenticateToken, async (req, res) => {
             query += ' WHERE userID = ?';
             params.push(userID);
 
-            db.query(query, params, (err3) => {
+                        db.query(query, params, (err3) => {
                 if (err3) {
                     return res.status(500).json({ error: 'Update failed' });
                 }
+
+                if (latitude !== undefined && longitude !== undefined) {
+                    db.query(
+                        'UPDATE consumer SET latitude = ?, longitude = ? WHERE userID = ?',
+                        [latitude, longitude, userID],
+                        (err4) => {
+                            if (err4) console.error('Failed to update consumer location:', err4.message);
+                        }
+                    );
+                }
+
                 res.status(200).json({ message: 'Profile updated successfully' });
             });
         });
