@@ -1546,13 +1546,29 @@ app.get('/api/shopping-list/:listID/details', authenticateToken, (req, res) => {
 //   one if none); 'replace' (default) archives existing active lists first.
 app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
     const { listID } = req.params;
-    const { userID, mode } = req.body;
+    const { userID, mode, listName } = req.body;
 
     if (!userID) {
         return res.status(400).json({ error: 'userID is required' });
     }
 
     const copyMode = mode === 'merge' ? 'merge' : 'replace';
+
+    // Preserve the source list's name on the copied active list. Prefer an explicit
+    // listName from the client; otherwise fall back to the source list's own name,
+    // and only use a generic label if neither is available.
+    const resolveName = (cb) => {
+        const provided = typeof listName === 'string' ? listName.trim() : '';
+        if (provided) {
+            return cb(provided);
+        }
+        db.query('SELECT listName FROM shoppinglist WHERE listID = ?', [listID], (errN, nameRows) => {
+            if (errN || nameRows.length === 0 || !nameRows[0].listName) {
+                return cb('Copied List');
+            }
+            cb(nameRows[0].listName);
+        });
+    };
 
     const itemQuery = `
         SELECT sli.productID, sli.quantity, p.productName,
@@ -1622,16 +1638,18 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
                     if (activeRows.length > 0) {
                         return populateList(activeRows[0].listID);
                     }
-                    db.query(
-                        'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
-                        [userID, 'Copied List'],
-                        (errC, created) => {
-                            if (errC) {
-                                return res.status(500).json({ error: 'Failed to create new list' });
+                    resolveName((newName) => {
+                        db.query(
+                            'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                            [userID, newName],
+                            (errC, created) => {
+                                if (errC) {
+                                    return res.status(500).json({ error: 'Failed to create new list' });
+                                }
+                                populateList(created.insertId);
                             }
-                            populateList(created.insertId);
-                        }
-                    );
+                        );
+                    });
                 }
             );
         } else {
@@ -1661,16 +1679,18 @@ app.post('/api/shopping-list/:listID/copy', authenticateToken, (req, res) => {
                         if (errR) {
                             return res.status(500).json({ error: 'Failed to copy list' });
                         }
-                        db.query(
-                            'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
-                            [userID, 'Copied List'],
-                            (err2, result) => {
-                                if (err2) {
-                                    return res.status(500).json({ error: 'Failed to create new list' });
+                        resolveName((newName) => {
+                            db.query(
+                                'INSERT INTO shoppinglist (consumerID, listName, status, createdDate, lastModifiedDate) VALUES (?, ?, \'active\', NOW(), NOW())',
+                                [userID, newName],
+                                (err2, result) => {
+                                    if (err2) {
+                                        return res.status(500).json({ error: 'Failed to create new list' });
+                                    }
+                                    populateList(result.insertId);
                                 }
-                                populateList(result.insertId);
-                            }
-                        );
+                            );
+                        });
                     }
                 );
             });
