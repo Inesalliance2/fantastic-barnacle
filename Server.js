@@ -1050,10 +1050,24 @@ app.get('/api/product/search', authenticateToken, (req, res) => {
     }
 
     const query = `
-        SELECT p.productID, p.productName, p.brand, pc.categoryName
+        SELECT p.productID, p.productName, p.brand, pc.categoryName,
+               MIN(latest.price) AS lowestPrice
         FROM product p
         LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+        LEFT JOIN storeproduct sp ON p.productID = sp.productID
+        LEFT JOIN (
+            SELECT ph.storeProductID, ph.price
+            FROM pricehistory ph
+            INNER JOIN (
+                SELECT storeProductID, MAX(recordedDate) AS maxDate
+                FROM pricehistory
+                GROUP BY storeProductID
+            ) latest_dates
+            ON ph.storeProductID = latest_dates.storeProductID
+            AND ph.recordedDate = latest_dates.maxDate
+        ) latest ON sp.storeProductID = latest.storeProductID
         WHERE p.productName LIKE CONCAT('%', ?, '%')
+        GROUP BY p.productID, p.productName, p.brand, pc.categoryName
         ORDER BY p.productName
         LIMIT 20
     `;
