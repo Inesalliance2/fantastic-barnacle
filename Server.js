@@ -1824,6 +1824,35 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
         return price * (1 - discountPct / 100);
     }
 
+    // --- A1) End point: optional destination; endMode precedence destination > round_trip > one_way ---
+    function validCoord(lat, lng) {
+        return typeof lat === 'number' && typeof lng === 'number'
+            && !Number.isNaN(lat) && !Number.isNaN(lng)
+            && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+    }
+    const _body = req.body || {};
+    const _hasLat = _body.endLat !== undefined && _body.endLat !== null;
+    const _hasLng = _body.endLng !== undefined && _body.endLng !== null;
+    if (_hasLat !== _hasLng) {
+        return res.status(400).json({ error: 'endLat and endLng must be provided together' });
+    }
+    let destination = null;
+    if (_hasLat && _hasLng) {
+        const dLat = Number(_body.endLat);
+        const dLng = Number(_body.endLng);
+        if (!validCoord(dLat, dLng)) {
+            return res.status(400).json({ error: 'Invalid destination coordinates' });
+        }
+        destination = {
+            latitude: dLat,
+            longitude: dLng,
+            label: (typeof _body.endLabel === 'string' && _body.endLabel.trim())
+                ? _body.endLabel.trim() : 'Destination'
+        };
+    }
+    // destination wins over isRoundTrip
+    const endMode = destination ? 'destination' : (isRoundTrip ? 'round_trip' : 'one_way');
+
     // --- 1) List items (+ owner) ---
     const listQuery = `
         SELECT sl.consumerID,
@@ -1850,7 +1879,8 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
         if (items.length === 0) {
             return res.status(200).json({
                 baseline: null, candidates: [], isRoundTrip,
-                fallbackToBaseline: false, message: 'This list has no items to optimise.'
+                fallbackToBaseline: false, message: 'This list has no items to optimise.',
+                endMode, destination: destination || null
             });
         }
 
@@ -1895,19 +1925,40 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                 const preferredChains = (prefRows || []).map(r => r.preferenceValue);
 
                 // --- 4) Candidate stores within range (+ optional chain filter) ---
-                let storeQuery = `
+                // A2: distanceKm is ALWAYS distance from the start. When a destination is set,
+                // a store also qualifies if it is within maxTravelDistanceKm of the destination
+                // (adds a destDistanceKm scalar expr + an OR in HAVING). No correlated subquery.
+                // Param order must follow the textual order of the '?' placeholders:
+                //   SELECT distanceKm: homeLat, homeLng, homeLat
+                //   [SELECT destDistanceKm (dest only): destLat, destLng, destLat]
+                //   [WHERE chain IN (...): preferredChains]
+                //   HAVING distanceKm <= ?: maxDistance
+                //   [OR destDistanceKm <= ? (dest only): maxDistance]
+                let storeSelect = `
                     SELECT storeID, storeName, storeChain, latitude, longitude,
                         (6371 * acos(cos(radians(?)) * cos(radians(latitude)) *
-                        cos(radians(longitude) - radians(?)) + sin(radians(?)) * sin(radians(latitude)))) AS distanceKm
+                        cos(radians(longitude) - radians(?)) + sin(radians(?)) * sin(radians(latitude)))) AS distanceKm`;
+                const storeParams = [homeLat, homeLng, homeLat];
+                if (destination) {
+                    storeSelect += `,
+                        (6371 * acos(cos(radians(?)) * cos(radians(latitude)) *
+                        cos(radians(longitude) - radians(?)) + sin(radians(?)) * sin(radians(latitude)))) AS destDistanceKm`;
+                    storeParams.push(destination.latitude, destination.longitude, destination.latitude);
+                }
+                let storeQuery = storeSelect + `
                     FROM store
                 `;
-                const storeParams = [homeLat, homeLng, homeLat];
                 if (preferredChains.length > 0) {
                     storeQuery += ` WHERE storeChain IN (${preferredChains.map(() => '?').join(',')})`;
                     storeParams.push(...preferredChains);
                 }
-                storeQuery += ` HAVING distanceKm <= ? ORDER BY distanceKm`;
-                storeParams.push(maxDistance);
+                if (destination) {
+                    storeQuery += ` HAVING distanceKm <= ? OR destDistanceKm <= ? ORDER BY distanceKm`;
+                    storeParams.push(maxDistance, maxDistance);
+                } else {
+                    storeQuery += ` HAVING distanceKm <= ? ORDER BY distanceKm`;
+                    storeParams.push(maxDistance);
+                }
 
                 db.query(storeQuery, storeParams, (errS, storeRows) => {
                     if (errS) {
@@ -1918,7 +1969,8 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                         return res.status(200).json({
                             baseline: null, candidates: [], isRoundTrip,
                             fallbackToBaseline: false,
-                            message: 'No stores found within your travel distance. Try increasing your max distance or clearing store preferences.'
+                            message: 'No stores found within your travel distance. Try increasing your max distance or clearing store preferences.',
+                            endMode, destination: destination || null
                         });
                     }
 
@@ -1958,7 +2010,8 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                             return res.status(200).json({
                                 baseline: null, candidates: [], isRoundTrip,
                                 fallbackToBaseline: false,
-                                message: 'None of your list items are available at nearby stores.'
+                                message: 'None of your list items are available at nearby stores.',
+                                endMode, destination: destination || null
                             });
                         }
                         const discQuery = `
@@ -2001,15 +2054,54 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                 return { covered, cost };
                             }
 
+                            // ---------- A3) Whole-trip distance + shortest-order helpers ----------
+                            // Trip legs by end mode:
+                            //   destination: start -> stores(in order) -> destination
+                            //   round_trip:  start -> stores(in order) -> start
+                            //   one_way:     start -> stores(in order)
+                            function tripDistanceKm(orderedStores) {
+                                let d = 0, pLat = homeLat, pLng = homeLng;
+                                for (const s of orderedStores) {
+                                    d += haversineKm(pLat, pLng, s.latitude, s.longitude);
+                                    pLat = s.latitude; pLng = s.longitude;
+                                }
+                                if (endMode === 'destination') {
+                                    d += haversineKm(pLat, pLng, destination.latitude, destination.longitude);
+                                } else if (endMode === 'round_trip') {
+                                    d += haversineKm(pLat, pLng, homeLat, homeLng);
+                                }
+                                return d;
+                            }
+                            // All permutations of up to 3 items (<= 6 orders).
+                            function permutations(arr) {
+                                if (arr.length <= 1) return [arr.slice()];
+                                const out = [];
+                                for (let i = 0; i < arr.length; i++) {
+                                    const rest = arr.slice(0, i).concat(arr.slice(i + 1));
+                                    for (const p of permutations(rest)) out.push([arr[i]].concat(p));
+                                }
+                                return out;
+                            }
+                            // Shortest whole-trip ordering of the used stores.
+                            function bestOrder(usedStores) {
+                                let best = usedStores.slice(), bestD = tripDistanceKm(usedStores);
+                                for (const perm of permutations(usedStores)) {
+                                    const d = tripDistanceKm(perm);
+                                    if (d < bestD) { bestD = d; best = perm; }
+                                }
+                                return { order: best, distanceKm: bestD };
+                            }
+
                             // ---------- BASELINE (B300) ----------
                             // Highest coverage %, tie-break lower total price.
+                            // A5: cost the baseline store over the SAME end mode (start -> store -> end point).
                             let baseline = null;
                             for (const s of candidateStores) {
                                 const { covered, cost } = storeItemCost(s.storeID);
                                 const coveredQty = items.filter(i => covered.has(i.productID))
                                     .reduce((sum, i) => sum + i.quantity, 0);
                                 const coveragePct = totalQty > 0 ? Math.round((coveredQty / totalQty) * 100) : 0;
-                                const dist = isRoundTrip ? s.distanceKm * 2 : s.distanceKm;
+                                const dist = tripDistanceKm([{ latitude: s.latitude, longitude: s.longitude }]);
                                 const fuel = dist * (consumption / 100) * fuelPrice;
                                 const cand = {
                                     store: s, coveragePct, groceries: cost,
@@ -2021,6 +2113,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                             }
                             const baselineGroceries = baseline.groceries;
                             const baselineTotalCost = baseline.totalCost;
+                            const baselineFuel = baseline.fuel; // A6: for extraFuelCost
 
                             // ---------- CANDIDATE GENERATION (greedy, <=3 stores) ----------
                             function bestStoreForUncovered(uncoveredIDs, chosenSet) {
@@ -2102,23 +2195,16 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                     groceriesTotal += bestPrice * it.quantity;
                                 }
 
-                                // stops in visit order (nearest-first among used stores)
-                                const usedStores = storeSet.filter(s => assignment[s.storeID])
-                                    .sort((a, b) => a.distanceKm - b.distanceKm);
-
-                                let distanceKm = 0;
-                                let prevLat = homeLat, prevLng = homeLng;
-                                const stops = [];
-                                usedStores.forEach((s, idx) => {
-                                    distanceKm += haversineKm(prevLat, prevLng, s.latitude, s.longitude);
-                                    prevLat = s.latitude; prevLng = s.longitude;
-                                    stops.push({
-                                        order: idx + 1, storeID: s.storeID, storeName: s.storeName,
-                                        latitude: s.latitude, longitude: s.longitude,
-                                        items: assignment[s.storeID]
-                                    });
-                                });
-                                if (isRoundTrip) distanceKm *= 2;
+                                // A3/A4: order used stores by shortest WHOLE trip (<=3 stores, <=6 perms);
+                                // distanceKm already includes the real return/destination leg via tripDistanceKm.
+                                const usedStores = storeSet.filter(s => assignment[s.storeID]);
+                                const ordered = bestOrder(usedStores);
+                                const distanceKm = ordered.distanceKm;
+                                const stops = ordered.order.map((s, idx) => ({
+                                    order: idx + 1, storeID: s.storeID, storeName: s.storeName,
+                                    latitude: s.latitude, longitude: s.longitude,
+                                    items: assignment[s.storeID]
+                                }));
 
                                 const fuelCost = distanceKm * (consumption / 100) * fuelPrice;
                                 const travelTimeMin = (distanceKm / AVG_SPEED_KMH) * 60;
@@ -2131,6 +2217,12 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                     .reduce((sum, i) => sum + i.quantity, 0);
                                 const coveragePct = totalQty > 0 ? Math.round((coveredQty / totalQty) * 100) : 0;
 
+                                // A6: Cost vs. Savings
+                                const grocerySavingsVsBaseline = baselineGroceries - groceriesTotal;
+                                const extraFuelCost = fuelCost - baselineFuel;
+                                const netBenefit = grocerySavingsVsBaseline - extraFuelCost;
+                                const storeCount = stops.length;
+
                                 const r2 = (n) => Math.round(n * 100) / 100;
                                 return {
                                     balancedScore: r2(balancedScore),
@@ -2142,7 +2234,11 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                     savingsVsBaseline: r2(savingsVsBaseline),
                                     coveragePct,
                                     uncoveredItems,
-                                    stops
+                                    stops,
+                                    grocerySavingsVsBaseline: r2(grocerySavingsVsBaseline),
+                                    extraFuelCost: r2(extraFuelCost),
+                                    netBenefit: r2(netBenefit),
+                                    storeCount
                                 };
                             }
 
@@ -2172,7 +2268,9 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                 candidates,
                                 isRoundTrip,
                                 fallbackToBaseline,
-                                message
+                                message,
+                                endMode,
+                                destination: destination || null
                             });
                         });
                     });
@@ -2180,4 +2278,96 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
             });
         });
     });
+});
+
+// =====================================================================
+// SAVED PLACES (B-destination-places / A8)
+// Home / Campus / Work end points. consumerID holds the consumer's userID
+// (same convention as shoppinglist.consumerID). All behind authenticateToken;
+// a user may only read/write/delete their own rows (else 403).
+// =====================================================================
+
+// Shared range check (mirrors optimize-route validCoord)
+function _validCoordAB(lat, lng) {
+    return typeof lat === 'number' && typeof lng === 'number'
+        && !Number.isNaN(lat) && !Number.isNaN(lng)
+        && lat >= -90 && lat <= 90 && lng >= -180 && lng <= 180;
+}
+
+// GET /api/user/:userID/saved-places
+app.get('/api/user/:userID/saved-places', authenticateToken, (req, res) => {
+    if (!req.user || Number(req.user.userID) !== Number(req.params.userID)) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const consumerID = Number(req.params.userID);
+    db.query(
+        'SELECT placeID, label, latitude, longitude FROM savedplace WHERE consumerID = ?',
+        [consumerID],
+        (err, rows) => {
+            if (err) {
+                console.error('GET saved-places error:', err.message);
+                return res.status(500).json({ error: 'Failed to load saved places' });
+            }
+            // DECIMAL columns arrive as strings from mysql2; send real numbers to the app
+            res.status(200).json((rows || []).map(r => ({
+                placeID: r.placeID, label: r.label,
+                latitude: Number(r.latitude), longitude: Number(r.longitude)
+            })));
+        }
+    );
+});
+
+// POST /api/user/:userID/saved-places  { label, latitude, longitude }
+// Creates, or replaces the row with the same label (INSERT ... ON DUPLICATE KEY UPDATE).
+app.post('/api/user/:userID/saved-places', authenticateToken, (req, res) => {
+    if (!req.user || Number(req.user.userID) !== Number(req.params.userID)) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const consumerID = Number(req.params.userID);
+    const b = req.body || {};
+    const label = (typeof b.label === 'string') ? b.label.trim() : '';
+    const lat = Number(b.latitude);
+    const lng = Number(b.longitude);
+    if (!label || label.length > 30) {
+        return res.status(400).json({ error: 'label is required (max 30 chars)' });
+    }
+    if (!_validCoordAB(lat, lng)) {
+        return res.status(400).json({ error: 'Invalid coordinates' });
+    }
+    db.query(
+        `INSERT INTO savedplace (consumerID, label, latitude, longitude)
+         VALUES (?, ?, ?, ?)
+         ON DUPLICATE KEY UPDATE latitude = VALUES(latitude), longitude = VALUES(longitude)`,
+        [consumerID, label, lat, lng],
+        (err) => {
+            if (err) {
+                console.error('POST saved-places error:', err.message);
+                return res.status(500).json({ error: 'Failed to save place' });
+            }
+            res.status(200).json({ message: 'Saved place stored successfully' });
+        }
+    );
+});
+
+// DELETE /api/user/:userID/saved-places/:placeID
+app.delete('/api/user/:userID/saved-places/:placeID', authenticateToken, (req, res) => {
+    if (!req.user || Number(req.user.userID) !== Number(req.params.userID)) {
+        return res.status(403).json({ error: 'Forbidden' });
+    }
+    const consumerID = Number(req.params.userID);
+    const placeID = Number(req.params.placeID);
+    db.query(
+        'DELETE FROM savedplace WHERE placeID = ? AND consumerID = ?',
+        [placeID, consumerID],
+        (err, result) => {
+            if (err) {
+                console.error('DELETE saved-places error:', err.message);
+                return res.status(500).json({ error: 'Failed to delete place' });
+            }
+            if (!result || result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Saved place not found' });
+            }
+            res.status(200).json({ message: 'Saved place deleted successfully' });
+        }
+    );
 });
