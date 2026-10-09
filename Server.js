@@ -2512,14 +2512,13 @@ app.put('/api/consumer/:userID/notification-preferences', authenticateToken, (re
 
 // D900: Given a newly-saved discount, compute which consumers are affected and
 // enqueue a notification for each. Only runs when the discount is ACTIVE
-// (isActive = TRUE AND today within start/end).
+// (manager's isActive toggle is the single source of truth; date window not enforced).
 app.post('/api/discount/:discountID/notify', authenticateToken, (req, res) => {
     const { discountID } = req.params;
 
     const activeCheck = `
         SELECT discountID FROM discountoffer
         WHERE discountID = ? AND isActive = TRUE
-          AND CURDATE() BETWEEN startDate AND endDate
     `;
     db.query(activeCheck, [discountID], (chkErr, chkRows) => {
         if (chkErr) {
