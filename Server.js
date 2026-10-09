@@ -728,7 +728,7 @@ app.get('/api/discounts/store/:storeID', authenticateToken, (req, res) => {
     const { storeID } = req.params;
     const query = `
         SELECT d.discountID, d.storeProductID, d.discountPercent,
-               d.startDate, d.endDate, p.productName
+               d.startDate, d.endDate, d.isActive, p.productName
         FROM discountoffer d
         JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
         JOIN product p ON sp.productID = p.productID
@@ -2395,6 +2395,222 @@ app.delete('/api/user/:userID/saved-places/:placeID', authenticateToken, (req, r
                 return res.status(404).json({ error: 'Saved place not found' });
             }
             res.status(200).json({ message: 'Saved place deleted successfully' });
+        }
+    );
+});
+
+// =====================================================================
+// D1700 / D100 / D300 / D900 — Notification preferences & delivery
+// (All routes below are additive. No existing endpoint is modified.)
+// =====================================================================
+
+// Toggle a discount active/inactive (manager flips an existing discount on or off).
+app.put('/api/discount/:discountID/active', authenticateToken, (req, res) => {
+    const { discountID } = req.params;
+    const { isActive } = req.body;
+
+    if (isActive === undefined || isActive === null) {
+        return res.status(400).json({ error: 'isActive field is required' });
+    }
+
+    db.query(
+        'UPDATE discountoffer SET isActive = ? WHERE discountID = ?',
+        [isActive ? 1 : 0, discountID],
+        (err, result) => {
+            if (err) {
+                console.error('PUT /api/discount/:discountID/active error:', err.message);
+                return res.status(500).json({ error: 'Failed to update discount status' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'Discount not found' });
+            }
+            res.status(200).json({ message: 'Discount status updated' });
+        }
+    );
+});
+
+// D1700: Load a consumer's notification preferences (toggle states).
+app.get('/api/consumer/:userID/notification-preferences', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+
+    const query = `
+        SELECT p.preferenceValue,
+               CASE WHEN up.consumerID IS NULL THEN 0 ELSE 1 END AS enabled
+        FROM preference p
+        LEFT JOIN userpreference up
+               ON up.preferenceID = p.preferenceID AND up.consumerID = ?
+        WHERE p.preferenceType = 'notification'
+    `;
+
+    db.query(query, [userID], (err, rows) => {
+        if (err) {
+            console.error('GET /api/consumer/:userID/notification-preferences error:', err.message);
+            return res.status(500).json({ error: 'Failed to fetch notification preferences' });
+        }
+
+        const prefs = { priceDrops: false, discounts: false, reminders: false };
+        for (const r of rows) {
+            if (Object.prototype.hasOwnProperty.call(prefs, r.preferenceValue)) {
+                prefs[r.preferenceValue] = r.enabled === 1;
+            }
+        }
+        res.status(200).json(prefs);
+    });
+});
+
+// D1700: Save a consumer's notification preferences.
+app.put('/api/consumer/:userID/notification-preferences', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    const body = req.body || {};
+    const wanted = ['priceDrops', 'discounts', 'reminders'];
+
+    db.query(
+        "SELECT preferenceID, preferenceValue FROM preference WHERE preferenceType = 'notification'",
+        (err, prefRows) => {
+            if (err) {
+                console.error('PUT notification-preferences (lookup) error:', err.message);
+                return res.status(500).json({ error: 'Failed to save notification preferences' });
+            }
+
+            const idByValue = {};
+            for (const r of prefRows) idByValue[r.preferenceValue] = r.preferenceID;
+
+            const tasks = [];
+            for (const key of wanted) {
+                if (!(key in body)) continue;
+                const prefID = idByValue[key];
+                if (!prefID) continue;
+                if (body[key] === true) {
+                    tasks.push({ sql: 'INSERT IGNORE INTO userpreference (consumerID, preferenceID) VALUES (?, ?)', params: [userID, prefID] });
+                } else {
+                    tasks.push({ sql: 'DELETE FROM userpreference WHERE consumerID = ? AND preferenceID = ?', params: [userID, prefID] });
+                }
+            }
+
+            if (tasks.length === 0) {
+                return res.status(200).json({ message: 'No preferences to update' });
+            }
+
+            let i = 0;
+            const runNext = () => {
+                if (i >= tasks.length) {
+                    return res.status(200).json({ message: 'Notification preferences saved' });
+                }
+                const t = tasks[i++];
+                db.query(t.sql, t.params, (e) => {
+                    if (e) {
+                        console.error('PUT notification-preferences (apply) error:', e.message);
+                        return res.status(500).json({ error: 'Failed to save notification preferences' });
+                    }
+                    runNext();
+                });
+            };
+            runNext();
+        }
+    );
+});
+
+// D900: Given a newly-saved discount, compute which consumers are affected and
+// enqueue a notification for each. Only runs when the discount is ACTIVE
+// (isActive = TRUE AND today within start/end).
+app.post('/api/discount/:discountID/notify', authenticateToken, (req, res) => {
+    const { discountID } = req.params;
+
+    const activeCheck = `
+        SELECT discountID FROM discountoffer
+        WHERE discountID = ? AND isActive = TRUE
+          AND CURDATE() BETWEEN startDate AND endDate
+    `;
+    db.query(activeCheck, [discountID], (chkErr, chkRows) => {
+        if (chkErr) {
+            console.error('POST notify (active check) error:', chkErr.message);
+            return res.status(500).json({ error: 'Failed to verify discount status' });
+        }
+        if (!chkRows || chkRows.length === 0) {
+            return res.status(400).json({ error: 'Discount is not active. Activate the discount first.' });
+        }
+        runNotify();
+    });
+
+    function runNotify() {
+    const findQuery = `
+        SELECT DISTINCT sl.consumerID, p.productName, d.discountPercent
+        FROM discountoffer d
+        JOIN storeproduct sp       ON d.storeProductID = sp.storeProductID
+        JOIN product p             ON sp.productID = p.productID
+        JOIN shoppinglistitem sli  ON sli.productID = sp.productID
+        JOIN shoppinglist sl       ON sl.listID = sli.listID AND sl.status = 'active'
+        JOIN userpreference up     ON up.consumerID = sl.consumerID
+        JOIN preference pref       ON pref.preferenceID = up.preferenceID
+                                   AND pref.preferenceType = 'notification'
+                                   AND pref.preferenceValue = 'discounts'
+        WHERE d.discountID = ?
+    `;
+
+    db.query(findQuery, [discountID], (err, rows) => {
+        if (err) {
+            console.error('POST /api/discount/:discountID/notify error:', err.message);
+            return res.status(500).json({ error: 'Failed to compute discount notifications' });
+        }
+
+        if (!rows || rows.length === 0) {
+            return res.status(200).json({ notified: 0, message: 'No matching opted-in consumers' });
+        }
+
+        let i = 0;
+        const insertNext = () => {
+            if (i >= rows.length) {
+                return res.status(200).json({ notified: rows.length });
+            }
+            const r = rows[i++];
+            const pct = r.discountPercent != null ? Math.round(r.discountPercent) : 0;
+            const title = 'Price Drop / Discount';
+            const message = r.productName + ' on your shopping list is now ' + pct + '% off!';
+            db.query(
+                "INSERT INTO notification (consumerID, title, message, type, isDelivered) VALUES (?, ?, ?, 'discount', FALSE)",
+                [r.consumerID, title, message],
+                (e) => {
+                    if (e) {
+                        console.error('POST notify (insert) error:', e.message);
+                        return res.status(500).json({ error: 'Failed to enqueue notifications' });
+                    }
+                    insertNext();
+                }
+            );
+        };
+        insertNext();
+    });
+    } // end runNotify
+});
+
+// D900/D100/D300 delivery: consumer polls for undelivered notifications.
+app.get('/api/consumer/:userID/notifications', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    db.query(
+        'SELECT notificationID, title, message, type, createdDate FROM notification WHERE consumerID = ? AND isDelivered = FALSE ORDER BY createdDate ASC',
+        [userID],
+        (err, rows) => {
+            if (err) {
+                console.error('GET /api/consumer/:userID/notifications error:', err.message);
+                return res.status(500).json({ error: 'Failed to fetch notifications' });
+            }
+            res.status(200).json(rows);
+        }
+    );
+});
+
+// Mark the consumer's notifications as delivered so they are not shown again.
+app.put('/api/consumer/:userID/notifications/mark-delivered', authenticateToken, (req, res) => {
+    const { userID } = req.params;
+    db.query(
+        'UPDATE notification SET isDelivered = TRUE WHERE consumerID = ? AND isDelivered = FALSE',
+        [userID],
+        (err) => {
+            if (err) {
+                console.error('PUT mark-delivered error:', err.message);
+                return res.status(500).json({ error: 'Failed to update notifications' });
+            }
+            res.status(200).json({ message: 'Notifications marked as delivered' });
         }
     );
 });
