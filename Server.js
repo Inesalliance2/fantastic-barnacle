@@ -309,7 +309,7 @@ app.post('/api/product', authenticateToken, (req, res) => {
                     const storeProductID = spResult.insertId;
 
                     db.query(
-                        'INSERT INTO pricehistory (storeProductID, price, recordedDate) VALUES (?, ?, CURDATE())',
+                        'INSERT INTO pricehistory (storeProductID, price, recordedDate) VALUES (?, ?, CURDATE()) ON DUPLICATE KEY UPDATE price = VALUES(price)',
                         [storeProductID, price],
                         (err3) => {
                             if (err3) {
@@ -421,7 +421,7 @@ app.get('/api/consumer/:userID/price-trends', authenticateToken, (req, res) => {
         SELECT p.preferenceValue
         FROM preference p
         JOIN userpreference up ON p.preferenceID = up.preferenceID
-        WHERE up.userID = ? AND p.preferenceType = 'store'
+        WHERE up.consumerID = ? AND p.preferenceType = 'store'
     `;
 
     db.query(prefQuery, [userID], (err, prefRows) => {
@@ -495,7 +495,7 @@ app.post('/api/product/:storeProductID/price', authenticateToken, (req, res) => 
     }
 
     db.query(
-        'INSERT INTO pricehistory (storeProductID, price, recordedDate) VALUES (?, ?, CURDATE())',
+        'INSERT INTO pricehistory (storeProductID, price, recordedDate) VALUES (?, ?, CURDATE()) ON DUPLICATE KEY UPDATE price = VALUES(price)',
         [storeProductID, price],
         (err) => {
             if (err) {
@@ -867,9 +867,9 @@ app.get('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
 
         // Get store preferences from userpreference table
         const storeQuery = `
-            SELECT p.preferenceValue, up.userID
+            SELECT p.preferenceValue, up.consumerID AS userID
             FROM preference p
-            LEFT JOIN userpreference up ON p.preferenceID = up.preferenceID AND up.userID = ?
+            LEFT JOIN userpreference up ON p.preferenceID = up.preferenceID AND up.consumerID = ?
             WHERE p.preferenceType = 'store'
         `;
 
@@ -891,9 +891,9 @@ app.get('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
 
             // Get dietary filters
             const dietaryQuery = `
-                SELECT p.preferenceValue, up.userID
+                SELECT p.preferenceValue, up.consumerID AS userID
                 FROM preference p
-                LEFT JOIN userpreference up ON p.preferenceID = up.preferenceID AND up.userID = ?
+                LEFT JOIN userpreference up ON p.preferenceID = up.preferenceID AND up.consumerID = ?
                 WHERE p.preferenceType = 'dietary'
             `;
 
@@ -936,7 +936,7 @@ app.put('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
         // Update store preferences: delete old, insert new
         if (preferredStores && Array.isArray(preferredStores)) {
             db.query(
-                `DELETE FROM userpreference WHERE userID = ? AND preferenceID IN (SELECT preferenceID FROM preference WHERE preferenceType = 'store')`,
+                `DELETE FROM userpreference WHERE consumerID = ? AND preferenceID IN (SELECT preferenceID FROM preference WHERE preferenceType = 'store')`,
                 [userID],
                 (err) => {
                     if (err) {
@@ -949,7 +949,7 @@ app.put('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
 
                     const placeholders = preferredStores.map(() => '?').join(',');
                     const insertQuery = `
-                        INSERT INTO userpreference (userID, preferenceID)
+                        INSERT INTO userpreference (consumerID, preferenceID)
                         SELECT ?, preferenceID FROM preference
                         WHERE preferenceType = 'store' AND preferenceValue IN (${placeholders})
                     `;
@@ -973,7 +973,7 @@ app.put('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
         if (dietaryFilters && typeof dietaryFilters === 'object') {
             // Delete existing dietary preferences
             db.query(
-                `DELETE FROM userpreference WHERE userID = ? AND preferenceID IN (SELECT preferenceID FROM preference WHERE preferenceType = 'dietary')`,
+                `DELETE FROM userpreference WHERE consumerID = ? AND preferenceID IN (SELECT preferenceID FROM preference WHERE preferenceType = 'dietary')`,
                 [userID],
                 (err) => {
                     if (err) {
@@ -989,7 +989,7 @@ app.put('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
 
                     const placeholders = activeFilters.map(() => '?').join(',');
                     const insertQuery = `
-                        INSERT INTO userpreference (userID, preferenceID)
+                        INSERT INTO userpreference (consumerID, preferenceID)
                         SELECT ?, preferenceID FROM preference
                         WHERE preferenceType = 'dietary' AND preferenceValue IN (${placeholders})
                     `;
@@ -2282,6 +2282,9 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
 
 // =====================================================================
 // SAVED PLACES (B-destination-places / A8)
+// Stored in the existing `destination` table (destinationID, consumerID, label,
+// latitude, longitude), which needs UNIQUE (consumerID, label) for the upsert below.
+// The app still receives the ID as "placeID".
 // Home / Campus / Work end points. consumerID holds the consumer's userID
 // (same convention as shoppinglist.consumerID). All behind authenticateToken;
 // a user may only read/write/delete their own rows (else 403).
@@ -2301,7 +2304,7 @@ app.get('/api/user/:userID/saved-places', authenticateToken, (req, res) => {
     }
     const consumerID = Number(req.params.userID);
     db.query(
-        'SELECT placeID, label, latitude, longitude FROM savedplace WHERE consumerID = ?',
+        'SELECT destinationID AS placeID, label, latitude, longitude FROM destination WHERE consumerID = ? ORDER BY label',
         [consumerID],
         (err, rows) => {
             if (err) {
@@ -2335,7 +2338,7 @@ app.post('/api/user/:userID/saved-places', authenticateToken, (req, res) => {
         return res.status(400).json({ error: 'Invalid coordinates' });
     }
     db.query(
-        `INSERT INTO savedplace (consumerID, label, latitude, longitude)
+        `INSERT INTO destination (consumerID, label, latitude, longitude)
          VALUES (?, ?, ?, ?)
          ON DUPLICATE KEY UPDATE latitude = VALUES(latitude), longitude = VALUES(longitude)`,
         [consumerID, label, lat, lng],
@@ -2357,7 +2360,7 @@ app.delete('/api/user/:userID/saved-places/:placeID', authenticateToken, (req, r
     const consumerID = Number(req.params.userID);
     const placeID = Number(req.params.placeID);
     db.query(
-        'DELETE FROM savedplace WHERE placeID = ? AND consumerID = ?',
+        'DELETE FROM destination WHERE destinationID = ? AND consumerID = ?',
         [placeID, consumerID],
         (err, result) => {
             if (err) {
