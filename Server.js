@@ -2613,3 +2613,33 @@ app.put('/api/consumer/:userID/notifications/mark-delivered', authenticateToken,
         }
     );
 });
+
+// =====================================================================
+// Rename a shopping list (Nick's list-rename feature; ported from the app repo's
+// betterbasket-api copy, which Render does not run). A user may only rename
+// their own list: shoppinglist.consumerID holds the consumer's userID.
+// =====================================================================
+app.put('/api/shopping-list/:listID/name', authenticateToken, (req, res) => {
+    const { listID } = req.params;
+    const { listName } = req.body || {};
+
+    if (!listName || typeof listName !== 'string' || !listName.trim()) {
+        return res.status(400).json({ error: 'listName is required' });
+    }
+    const cleanName = listName.trim().slice(0, 100);   // column is varchar(100)
+
+    db.query(
+        'UPDATE shoppinglist SET listName = ?, lastModifiedDate = NOW() WHERE listID = ? AND consumerID = ?',
+        [cleanName, listID, req.user.userID],
+        (err, result) => {
+            if (err) {
+                console.error('PUT /api/shopping-list/:listID/name error:', err.message);
+                return res.status(500).json({ error: 'Failed to rename list' });
+            }
+            if (result.affectedRows === 0) {
+                return res.status(404).json({ error: 'List not found' });
+            }
+            res.status(200).json({ message: 'List renamed', listName: cleanName });
+        }
+    );
+});
