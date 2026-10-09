@@ -1807,6 +1807,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
     const GAMMA_RAND_PER_MIN   = 0.15;   // Balanced Score time weight (Rand/min)
     const MAX_STORES_PER_ROUTE = 3;
     const MAX_CANDIDATES       = 3;
+    const STOP_MINUTES_PER_STORE = 15;   // time spent inside each store, counted in the Balanced Score
 
     // --- Helpers ---
     const toRad = (d) => (d * Math.PI) / 180;
@@ -2164,13 +2165,21 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
 
                             const rawCandidates = seeds.map(buildGreedy);
 
-                            // De-duplicate by store-set signature
-                            const seen = new Set();
-                            const uniqueStoreSets = [];
-                            for (const set of rawCandidates) {
-                                const sig = set.map(s => s.storeID).sort((a, b) => a - b).join(',');
-                                if (set.length > 0 && !seen.has(sig)) { seen.add(sig); uniqueStoreSets.push(set); }
-                            }
+                            // Exhaustive search: every combination of 1..MAX_STORES_PER_ROUTE eligible stores.
+                            // The greedy seeds ignore distance, so on their own they can miss the best route
+                            // (and never propose the baseline store itself). Combinations are cheap to score:
+                            // 20 stores -> 1350 sets.
+                            (function addCombos(startIdx, current) {
+                                if (current.length > 0) rawCandidates.push(current.slice());
+                                if (current.length === MAX_STORES_PER_ROUTE) return;
+                                for (let k = startIdx; k < candidateStores.length; k++) {
+                                    current.push(candidateStores[k]);
+                                    addCombos(k + 1, current);
+                                    current.pop();
+                                }
+                            })(0, []);
+
+                            const uniqueStoreSets = rawCandidates.filter(set => set.length > 0);
 
                             // ---------- METRICS + SCORING per candidate ----------
                             function assembleCandidate(storeSet) {
@@ -2209,7 +2218,8 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                 const fuelCost = distanceKm * (consumption / 100) * fuelPrice;
                                 const travelTimeMin = (distanceKm / AVG_SPEED_KMH) * 60;
                                 const basketSavings = baselineGroceries - groceriesTotal;
-                                const balancedScore = basketSavings - (fuelCost + GAMMA_RAND_PER_MIN * travelTimeMin);
+                                // time = driving time + 15 minutes inside each store, so an extra stop has to earn its place
+                                const balancedScore = basketSavings - (fuelCost + GAMMA_RAND_PER_MIN * (travelTimeMin + STOP_MINUTES_PER_STORE * stops.length));
                                 const totalCost = groceriesTotal + fuelCost;
                                 const savingsVsBaseline = baselineTotalCost - totalCost;
                                 const coveredQty = totalQty - items
@@ -2242,8 +2252,22 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                 };
                             }
 
-                            let candidates = uniqueStoreSets.map(assembleCandidate)
-                                .sort((a, b) => b.balancedScore - a.balancedScore)
+                            // Assemble every set, drop repeats (same stores actually used), keep only routes
+                            // that buy as much of the list as is possible, then rank by Balanced Score.
+                            const assembled = [];
+                            const seenRoutes = new Set();
+                            for (const set of uniqueStoreSets) {
+                                const cand = assembleCandidate(set);
+                                if (cand.stops.length === 0) continue;
+                                const sig = cand.stops.map(s => s.storeID).sort((a, b) => a - b).join(',');
+                                if (seenRoutes.has(sig)) continue;
+                                seenRoutes.add(sig);
+                                assembled.push(cand);
+                            }
+                            const bestCoverage = assembled.reduce((m, c2) => Math.max(m, c2.coveragePct), 0);
+                            let candidates = assembled
+                                .filter(c2 => c2.coveragePct === bestCoverage)
+                                .sort((a, b) => (b.balancedScore - a.balancedScore) || (a.stops.length - b.stops.length))
                                 .slice(0, MAX_CANDIDATES);
                             candidates.forEach((c2, i) => { c2.rank = i + 1; });
 
