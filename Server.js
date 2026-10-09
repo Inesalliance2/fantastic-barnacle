@@ -2276,7 +2276,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                             let message = null;
                             if (candidates.length === 0 || candidates[0].savingsVsBaseline < 0) {
                                 fallbackToBaseline = true;
-                                message = 'Shopping at your nearest store is already the best option.';
+                                message = 'A single store is the best option for this list.';
                             }
 
                             return res.status(200).json({
