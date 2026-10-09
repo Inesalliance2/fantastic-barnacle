@@ -1080,6 +1080,39 @@ app.get('/api/product/search', authenticateToken, (req, res) => {
     });
 });
 
+// Whole product catalogue for the Add Item screen: every product with its category and the
+// lowest current price across all stores, ordered by category then name. The app loads this
+// once and then filters by category and search text on the phone.
+app.get('/api/products/catalogue', authenticateToken, (req, res) => {
+    const query = `
+        SELECT p.productID, p.productName, p.brand, pc.categoryName,
+               MIN(latest.price) AS lowestPrice
+        FROM product p
+        LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
+        LEFT JOIN storeproduct sp ON p.productID = sp.productID
+        LEFT JOIN (
+            SELECT ph.storeProductID, ph.price
+            FROM pricehistory ph
+            INNER JOIN (
+                SELECT storeProductID, MAX(recordedDate) AS maxDate
+                FROM pricehistory
+                GROUP BY storeProductID
+            ) latest_dates
+            ON ph.storeProductID = latest_dates.storeProductID
+            AND ph.recordedDate = latest_dates.maxDate
+        ) latest ON sp.storeProductID = latest.storeProductID
+        GROUP BY p.productID, p.productName, p.brand, pc.categoryName
+        ORDER BY pc.categoryName, p.productName
+    `;
+    db.query(query, (err, results) => {
+        if (err) {
+            console.error('GET /api/products/catalogue error:', err.message);
+            return res.status(500).json({ error: 'Failed to load products' });
+        }
+        res.status(200).json(results);
+    });
+});
+
 // Multi-store price history for a product (C700/C900)
 app.get('/api/product/:productID/pricehistory', authenticateToken, (req, res) => {
     const { productID } = req.params;
@@ -2019,6 +2052,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                             SELECT storeProductID, discountPercent
                             FROM discountoffer
                             WHERE CURDATE() BETWEEN startDate AND endDate
+                              AND COALESCE(isActive, 1) = 1   -- a discount the manager switched off does not count
                               AND storeProductID IN (${spIDs.map(() => '?').join(',')})
                         `;
                         db.query(discQuery, spIDs, (errD, discRows) => {
@@ -2031,12 +2065,16 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                             (discRows || []).forEach(d => { discountBySp[d.storeProductID] = Number(d.discountPercent); });
 
                             // priceMap[storeID][productID] = effective unit price
+                            // regularMap[storeID][productID] = shelf price before any discount
                             const priceMap = {};
+                            const regularMap = {};
                             (spRows || []).forEach(r => {
                                 if (r.price == null) return; // no price history → skip
                                 const eff = effectivePrice(Number(r.price), discountBySp[r.storeProductID]);
                                 if (!priceMap[r.storeID]) priceMap[r.storeID] = {};
                                 priceMap[r.storeID][r.productID] = eff;
+                                if (!regularMap[r.storeID]) regularMap[r.storeID] = {};
+                                regularMap[r.storeID][r.productID] = Number(r.price);
                             });
 
                             // ---------- Compute per-store coverage + basket ----------
@@ -2187,6 +2225,7 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                 const assignment = {}; // storeID -> [{productName, quantity, effectivePrice}]
                                 const uncoveredItems = [];
                                 let groceriesTotal = 0;
+                                let discountSavings = 0; // rand taken off by deals on the items in this route
                                 for (const it of items) {
                                     let bestStoreID = null, bestPrice = Infinity;
                                     for (const s of storeSet) {
@@ -2197,11 +2236,16 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                     }
                                     if (bestStoreID == null) { uncoveredItems.push(it.productName); continue; }
                                     if (!assignment[bestStoreID]) assignment[bestStoreID] = [];
+                                    const regular = (regularMap[bestStoreID] || {})[it.productID];
                                     assignment[bestStoreID].push({
                                         productName: it.productName, quantity: it.quantity,
-                                        effectivePrice: Math.round(bestPrice * 100) / 100
+                                        effectivePrice: Math.round(bestPrice * 100) / 100,
+                                        regularPrice: regular != null ? Math.round(regular * 100) / 100 : null
                                     });
                                     groceriesTotal += bestPrice * it.quantity;
+                                    if (regular != null && regular > bestPrice) {
+                                        discountSavings += (regular - bestPrice) * it.quantity;
+                                    }
                                 }
 
                                 // A3/A4: order used stores by shortest WHOLE trip (<=3 stores, <=6 perms);
@@ -2248,7 +2292,8 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                     grocerySavingsVsBaseline: r2(grocerySavingsVsBaseline),
                                     extraFuelCost: r2(extraFuelCost),
                                     netBenefit: r2(netBenefit),
-                                    storeCount
+                                    storeCount,
+                                    discountSavings: r2(discountSavings)
                                 };
                             }
 
@@ -2279,8 +2324,14 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                                 message = 'A single store is the best option for this list.';
                             }
 
+                            // The best single store as a full route, so the app can always offer
+                            // "Quickest: one stop" next to the best-savings route.
+                            const oneStop = assembleCandidate([baseline.store]);
+                            oneStop.rank = 0;
+
                             return res.status(200).json({
                                 consumerLocation: { latitude: homeLat, longitude: homeLng },
+                                oneStop,
                                 baseline: {
                                     storeID: baseline.store.storeID,
                                     storeName: baseline.store.storeName,
@@ -2533,9 +2584,10 @@ app.post('/api/discount/:discountID/notify', authenticateToken, (req, res) => {
 
     function runNotify() {
     const findQuery = `
-        SELECT DISTINCT sl.consumerID, p.productName, d.discountPercent
+        SELECT DISTINCT sl.consumerID, p.productName, d.discountPercent, st.storeName
         FROM discountoffer d
         JOIN storeproduct sp       ON d.storeProductID = sp.storeProductID
+        JOIN store st              ON st.storeID = sp.storeID
         JOIN product p             ON sp.productID = p.productID
         JOIN shoppinglistitem sli  ON sli.productID = sp.productID
         JOIN shoppinglist sl       ON sl.listID = sli.listID AND sl.status = 'active'
@@ -2563,8 +2615,10 @@ app.post('/api/discount/:discountID/notify', authenticateToken, (req, res) => {
             }
             const r = rows[i++];
             const pct = r.discountPercent != null ? Math.round(r.discountPercent) : 0;
-            const title = 'Price Drop / Discount';
-            const message = r.productName + ' on your shopping list is now ' + pct + '% off!';
+            // Say which shop the deal is at, in the title and in the message.
+            const shop = r.storeName ? r.storeName : 'a store near you';
+            const title = pct + '% off at ' + shop;
+            const message = r.productName + ' on your shopping list is now ' + pct + '% off at ' + shop + '.';
             db.query(
                 "INSERT INTO notification (consumerID, title, message, type, isDelivered) VALUES (?, ?, ?, 'discount', FALSE)",
                 [r.consumerID, title, message],
