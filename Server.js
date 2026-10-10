@@ -208,6 +208,95 @@ app.get('/api/user/:userID', authenticateToken, (req, res) => {
     });
 });
 
+// =====================================================================
+// Forgot / Reset password (no real email is sent — the reset code and
+// steps are returned to the app and shown in-app). Codes are stored in
+// memory with a short expiry; no DB schema change is required.
+// =====================================================================
+
+// Email (lowercased) -> { code, expiresAt }
+const passwordResetCodes = new Map();
+const RESET_CODE_TTL_MS = 15 * 60 * 1000; // 15 minutes
+
+const resetStepsText =
+    '1. Note the 4-digit reset code above.\n' +
+    '2. Tap "Reset password now".\n' +
+    '3. Enter the code and your new password.\n' +
+    '4. Tap Reset Password, then log in with your new password.';
+
+// Request a password reset. Always responds 200 with a neutral message so the
+// endpoint does not reveal which emails are registered. When the email DOES exist,
+// the response also includes { code, steps } so the app can show the instructions.
+app.post('/api/forgot-password', (req, res) => {
+    const email = (req.body && req.body.email ? String(req.body.email) : '').trim();
+
+    if (!email) {
+        return res.status(400).json({ error: 'Email is required' });
+    }
+
+    db.query('SELECT userID FROM user WHERE email = ?', [email], (err, results) => {
+        if (err) {
+            console.error('POST /api/forgot-password error:', err.message);
+            return res.status(500).json({ error: 'Failed to process request' });
+        }
+
+        if (!results || results.length === 0) {
+            // Neutral response — do not leak whether the email exists.
+            return res.status(200).json({ message: 'If that email is registered, reset instructions have been issued.' });
+        }
+
+        const code = String(Math.floor(1000 + Math.random() * 9000)); // 4-digit
+        passwordResetCodes.set(email.toLowerCase(), { code, expiresAt: Date.now() + RESET_CODE_TTL_MS });
+
+        res.status(200).json({
+            message: 'Reset instructions issued.',
+            code: code,
+            steps: resetStepsText
+        });
+    });
+});
+
+// Verify a reset code and set a new password.
+app.post('/api/reset-password', async (req, res) => {
+    const email = (req.body && req.body.email ? String(req.body.email) : '').trim();
+    const code = (req.body && req.body.code ? String(req.body.code) : '').trim();
+    const newPassword = req.body ? req.body.newPassword : null;
+
+    if (!email || !code || !newPassword) {
+        return res.status(400).json({ error: 'Email, code and new password are required' });
+    }
+    if (String(newPassword).length < 6) {
+        return res.status(400).json({ error: 'New password must be at least 6 characters' });
+    }
+
+    const entry = passwordResetCodes.get(email.toLowerCase());
+    if (!entry || entry.code !== code) {
+        return res.status(400).json({ error: 'That code is not valid. Please request a new one.' });
+    }
+    if (Date.now() > entry.expiresAt) {
+        passwordResetCodes.delete(email.toLowerCase());
+        return res.status(400).json({ error: 'That code has expired. Please request a new one.' });
+    }
+
+    try {
+        const passwordHash = await bcrypt.hash(String(newPassword), 10);
+        db.query('UPDATE user SET passwordHash = ? WHERE email = ?', [passwordHash, email], (err, result) => {
+            if (err) {
+                console.error('POST /api/reset-password error:', err.message);
+                return res.status(500).json({ error: 'Failed to reset password' });
+            }
+            if (!result || result.affectedRows === 0) {
+                return res.status(404).json({ error: 'User not found' });
+            }
+            passwordResetCodes.delete(email.toLowerCase()); // one-time use
+            res.status(200).json({ message: 'Password reset successfully' });
+        });
+    } catch (e) {
+        console.error('POST /api/reset-password hash error:', e.message);
+        res.status(500).json({ error: 'Failed to reset password' });
+    }
+});
+
 // Update user profile
 app.put('/api/user/:userID', authenticateToken, async (req, res) => {
     const { userID } = req.params;
