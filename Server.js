@@ -728,10 +728,11 @@ app.get('/api/discounts/store/:storeID', authenticateToken, (req, res) => {
     const { storeID } = req.params;
     const query = `
         SELECT d.discountID, d.storeProductID, d.discountPercent,
-               d.startDate, d.endDate, d.isActive, p.productName
+               d.startDate, d.endDate, d.isActive, p.productName, pc.categoryName
         FROM discountoffer d
         JOIN storeproduct sp ON d.storeProductID = sp.storeProductID
         JOIN product p ON sp.productID = p.productID
+        LEFT JOIN productcategory pc ON p.categoryID = pc.categoryID
         WHERE sp.storeID = ?
         ORDER BY d.endDate DESC
     `;
