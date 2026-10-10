@@ -920,6 +920,9 @@ app.put('/api/consumer/:userID/preferences', authenticateToken, (req, res) => {
     const { userID } = req.params;
     const { maxTravelDistanceKm, preferredStores, dietaryFilters } = req.body;
 
+    if (maxTravelDistanceKm !== undefined && maxTravelDistanceKm > 30) {
+        return res.status(400).json({ error: 'The furthest you can set is 30 km' });
+    }
     if (maxTravelDistanceKm !== undefined && maxTravelDistanceKm <= 0) {
         return res.status(400).json({ error: 'Distance must be greater than 0' });
     }
@@ -1842,6 +1845,10 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
     const MAX_STORES_PER_ROUTE = 3;
     const MAX_CANDIDATES       = 3;
     const STOP_MINUTES_PER_STORE = 15;   // time spent inside each store, counted in the Balanced Score
+    const MAX_ALLOWED_DISTANCE_KM = 30;   // hard ceiling on the search radius
+    const SHORTLIST_ABOVE = 12;          // shortlist only when more stores than this are in range
+    const SHORTLIST_CHEAPEST = 8;        // how many of the cheapest whole-list stores to keep
+    const SHORTLIST_NEAREST = 4;         // how many of the nearest stores to keep
 
     // --- Helpers ---
     const toRad = (d) => (d * Math.PI) / 180;
@@ -1941,7 +1948,10 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
             }
             const homeLat = Number(c.latitude);
             const homeLng = Number(c.longitude);
-            const maxDistance = c.maxTravelDistanceKm != null ? Number(c.maxTravelDistanceKm) : DEFAULT_MAX_DISTANCE;
+            // Never search further than 30 km, whatever is saved: beyond that there are no more
+            // stores in the city to find, only more work for the route search.
+            const maxDistance = Math.min(MAX_ALLOWED_DISTANCE_KM,
+                c.maxTravelDistanceKm != null ? Number(c.maxTravelDistanceKm) : DEFAULT_MAX_DISTANCE);
             const fuelPrice = c.fuelPricePerLitre != null ? Number(c.fuelPricePerLitre) : DEFAULT_FUEL_PRICE;
             const consumption = c.consumptionLitresPer100km != null ? Number(c.consumptionLitresPer100km) : DEFAULT_CONSUMPTION;
 
@@ -2208,11 +2218,44 @@ app.post('/api/shopping-list/:listID/optimize-route', authenticateToken, (req, r
                             // The greedy seeds ignore distance, so on their own they can miss the best route
                             // (and never propose the baseline store itself). Combinations are cheap to score:
                             // 20 stores -> 1350 sets.
+                            //
+                            // SHORTLIST. With many stores in range, "every combination" explodes
+                            // (100 stores -> over 160 000 sets), so first keep only the stores that
+                            // could plausibly be part of the best route:
+                            //   a) the cheapest stores for the whole list
+                            //   b) any store that is the cheapest for at least one item on the list
+                            //   c) the stores nearest the start, and nearest the destination
+                            //   d) the baseline store
+                            // A store that is none of these is dearer on every item AND further away,
+                            // so no good route would include it. With few stores, all of them are kept.
+                            let comboStores = candidateStores;
+                            if (candidateStores.length > SHORTLIST_ABOVE) {
+                                const keep = new Set([baseline.store.storeID]);
+                                const coverage = (st) => storeItemCost(st.storeID).covered.size;
+                                [...candidateStores]
+                                    .sort((a, b) => (coverage(b) - coverage(a)) ||
+                                        (storeItemCost(a.storeID).cost - storeItemCost(b.storeID).cost))
+                                    .slice(0, SHORTLIST_CHEAPEST).forEach(st => keep.add(st.storeID));        // a
+                                for (const it of items) {                                                      // b
+                                    let bestID = null, bestPrice = Infinity;
+                                    for (const st of candidateStores) {
+                                        const price = (priceMap[st.storeID] || {})[it.productID];
+                                        if (price != null && price < bestPrice) { bestPrice = price; bestID = st.storeID; }
+                                    }
+                                    if (bestID != null) keep.add(bestID);
+                                }
+                                candidateStores.slice(0, SHORTLIST_NEAREST).forEach(st => keep.add(st.storeID)); // c (sorted by distance)
+                                if (destination) {
+                                    [...candidateStores].sort((a, b) => a.destDistanceKm - b.destDistanceKm)
+                                        .slice(0, SHORTLIST_NEAREST).forEach(st => keep.add(st.storeID));
+                                }
+                                comboStores = candidateStores.filter(st => keep.has(st.storeID));
+                            }
                             (function addCombos(startIdx, current) {
                                 if (current.length > 0) rawCandidates.push(current.slice());
                                 if (current.length === MAX_STORES_PER_ROUTE) return;
-                                for (let k = startIdx; k < candidateStores.length; k++) {
-                                    current.push(candidateStores[k]);
+                                for (let k = startIdx; k < comboStores.length; k++) {
+                                    current.push(comboStores[k]);
                                     addCombos(k + 1, current);
                                     current.pop();
                                 }
