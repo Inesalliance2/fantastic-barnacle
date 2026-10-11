@@ -2769,20 +2769,109 @@ app.post('/api/discount/:discountID/notify', authenticateToken, (req, res) => {
     } // end runNotify
 });
 
+// =====================================================================
+// D100: System Reminder Notification — "this deal ends tomorrow".
+//
+// A consumer gets one reminder for each deal that:
+//   - is on a product in their ACTIVE shopping list,
+//   - is switched on and ends TOMORROW,
+//   - did not start today (a brand-new deal already gets the manager's D900 message),
+//   - and only if their "Receive reminder notifications" switch is on.
+//
+// When it runs: the server on Render goes to sleep when idle, so a midnight timer would
+// often be missed. Instead the check runs when the consumer's app asks for notifications
+// (it asks every few seconds while the dashboard is open), at most once a minute per user.
+// The reminder is therefore waiting the first time the consumer opens the app that day.
+//
+// No duplicates: a reminder is only written if the same one was not already written for
+// that consumer in the last two days.
+// =====================================================================
+const REMINDER_CHECK_EVERY_MS = 60 * 1000;   // how often one user's deals are re-checked
+const lastReminderCheck = new Map();          // userID -> time of that user's last check
+
+// Today's date in South Africa as yyyy-mm-dd (the database server's clock runs on UTC,
+// which is two hours behind and would get "tomorrow" wrong just after midnight).
+function todaySouthAfrica() {
+    return new Date().toLocaleDateString('en-CA', { timeZone: 'Africa/Johannesburg' });
+}
+
+// Writes any "ends tomorrow" reminders that are due for this consumer, then calls done().
+// A problem here must never stop the consumer getting their other notifications, so every
+// error is logged and done() is still called.
+function createExpiryReminders(userID, done) {
+    const key = String(userID);
+    const now = Date.now();
+    if (now - (lastReminderCheck.get(key) || 0) < REMINDER_CHECK_EVERY_MS) return done();
+    lastReminderCheck.set(key, now);
+
+    const today = todaySouthAfrica();
+    const findQuery = `
+        SELECT DISTINCT p.productName, d.discountPercent, st.storeName
+        FROM discountoffer d
+        JOIN storeproduct sp       ON sp.storeProductID = d.storeProductID AND sp.available = TRUE
+        JOIN store st              ON st.storeID = sp.storeID
+        JOIN product p             ON p.productID = sp.productID
+        JOIN shoppinglistitem sli  ON sli.productID = sp.productID
+        JOIN shoppinglist sl       ON sl.listID = sli.listID AND sl.status = 'active' AND sl.consumerID = ?
+        JOIN userpreference up     ON up.consumerID = sl.consumerID
+        JOIN preference pref       ON pref.preferenceID = up.preferenceID
+                                   AND pref.preferenceType = 'notification'
+                                   AND pref.preferenceValue = 'reminders'
+        WHERE COALESCE(d.isActive, 1) = 1
+          AND DATE(d.endDate) = DATE_ADD(?, INTERVAL 1 DAY)
+          AND DATE(d.startDate) < ?
+        ORDER BY p.productName, st.storeName
+    `;
+    db.query(findQuery, [userID, today, today], (err, rows) => {
+        if (err) {
+            console.error('D100 reminders (find) error:', err.message);
+            return done();
+        }
+        if (!rows || rows.length === 0) return done();
+
+        let i = 0;
+        const insertNext = () => {
+            if (i >= rows.length) return done();
+            const r = rows[i++];
+            const pct = r.discountPercent != null ? Math.round(r.discountPercent) : 0;
+            const shop = r.storeName ? r.storeName : 'a store near you';
+            const title = 'Deal ends tomorrow';
+            const message = r.productName + ' on your shopping list is ' + pct + '% off at ' + shop + ' until tomorrow.';
+            const insertQuery = `
+                INSERT INTO notification (consumerID, title, message, type, isDelivered)
+                SELECT ?, ?, ?, 'reminder', FALSE FROM DUAL
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM notification
+                    WHERE consumerID = ? AND type = 'reminder' AND message = ?
+                      AND createdDate >= DATE_SUB(NOW(), INTERVAL 2 DAY)
+                )
+            `;
+            db.query(insertQuery, [userID, title, message, userID, message], (e) => {
+                if (e) console.error('D100 reminders (insert) error:', e.message);
+                insertNext();
+            });
+        };
+        insertNext();
+    });
+}
+
 // D900/D100/D300 delivery: consumer polls for undelivered notifications.
+// Any D100 reminders that are due are written first, so they come back in the same answer.
 app.get('/api/consumer/:userID/notifications', authenticateToken, (req, res) => {
     const { userID } = req.params;
-    db.query(
-        'SELECT notificationID, title, message, type, createdDate FROM notification WHERE consumerID = ? AND isDelivered = FALSE ORDER BY createdDate ASC',
-        [userID],
-        (err, rows) => {
-            if (err) {
-                console.error('GET /api/consumer/:userID/notifications error:', err.message);
-                return res.status(500).json({ error: 'Failed to fetch notifications' });
+    createExpiryReminders(userID, () => {
+        db.query(
+            'SELECT notificationID, title, message, type, createdDate FROM notification WHERE consumerID = ? AND isDelivered = FALSE ORDER BY createdDate ASC',
+            [userID],
+            (err, rows) => {
+                if (err) {
+                    console.error('GET /api/consumer/:userID/notifications error:', err.message);
+                    return res.status(500).json({ error: 'Failed to fetch notifications' });
+                }
+                res.status(200).json(rows);
             }
-            res.status(200).json(rows);
-        }
-    );
+        );
+    });
 });
 
 // Mark the consumer's notifications as delivered so they are not shown again.
